@@ -1,1 +1,23 @@
+# crawler output + inputs
 /data/
+
+# python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# notebooks
+.ipynb_checkpoints/
+
+# local databases
+*.db
+*.db-wal
+*.db-shm
+
+# os
+.DS_Store
+/.claude/
+/.vscode/
