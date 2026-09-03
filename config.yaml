@@ -1,0 +1,44 @@
+paths:
+  data_dir: data
+  # The Kaggle snapshot. Download with:
+  #   kaggle datasets download -d Cornell-University/arxiv -p data/metadata --unzip
+  metadata_file: data/raw/arxiv-metadata-oai-snapshot.json
+
+# Which papers `prepare` loads into the manifest. Empty/null means "no filter".
+scope:
+  categories: []
+  primary_only: false # true => match only against the paper's primary category
+  date_from: null
+  date_to: null
+  max_papers: null
+
+crawl:
+  base_url: https://export.arxiv.org  # arXiv's dedicated host for programmatic access
+  contact: ai@crc.calvin.ac.id
+  # Global token bucket, shared across ALL download workers. arXiv's stated ceiling is
+  # bursts of 4 req/s with a 1s sleep; 1.0 req/s is a deliberately polite default.
+  # Raising `workers` increases concurrency, never the request rate past this cap.
+  rate_per_sec: 1.0
+  burst: 4
+  workers: 8
+  timeout: 60
+  max_attempts: 3
+  chunk_size: 65536
+
+convert:
+  converter: pymupdf # pymupdf | pdfplumber | docling | opendataloader
+  workers: 8
+  timeout: 120 # seconds per PDF, before the worker is killed
+  max_pages: 300
+  table_strategy: lines_strict
+  table_fallback_strategy: null
+  min_chars_per_page: 100 # below this a paper is flagged `low_text` (likely a scan)
+
+  # --- technical-paper handling ---
+  detect_pseudocode: true
+  preserve_equations: true
+  max_table_columns: 25
+
+postgres:
+  dsn: null # e.g. "postgresql://user:pass@localhost:5432/arxiv"
+  table: papers
