@@ -89,6 +89,63 @@ def test_reset_failed_respects_the_attempt_ceiling(tmp_path):
         assert m.reset_failed("convert", max_attempts=4) == 1
 
 
+def _fail(m, arxiv_id, status=FAILED_CONVERT, attempts=1):
+    m.conn.execute("UPDATE papers SET status=?, attempts=? WHERE arxiv_id=?",
+                   (status, attempts, arxiv_id))
+    m.conn.commit()
+
+
+def test_claim_batch_honours_the_attempt_ceiling(manifest):
+    manifest.add_papers(_rows(3))
+    _fail(manifest, "2301.00000", FAILED_CONVERT, attempts=1)
+    _fail(manifest, "2301.00001", FAILED_DOWNLOAD, attempts=4)
+
+    claimed = manifest.claim_batch(10, (FAILED_CONVERT, FAILED_DOWNLOAD), max_attempts=4)
+    assert [r.arxiv_id for r in claimed] == ["2301.00000"]   # the exhausted one is left
+
+
+def test_claimable_ids_and_counts_agree(manifest):
+    manifest.add_papers(_rows(4))
+    _fail(manifest, "2301.00000", FAILED_CONVERT, attempts=1)
+    _fail(manifest, "2301.00001", FAILED_DOWNLOAD, attempts=2)
+    _fail(manifest, "2301.00002", FAILED_CONVERT, attempts=4)
+
+    statuses = (FAILED_DOWNLOAD, FAILED_CONVERT)
+    ids = manifest.claimable_ids(statuses, max_attempts=4)
+    assert sorted(ids) == ["2301.00000", "2301.00001"]
+    assert manifest.count_claimable(statuses, max_attempts=4) == 2
+    assert manifest.count_claimable(statuses) == 3            # no ceiling: all three
+
+
+def test_claim_ids_skips_rows_that_moved_on(manifest):
+    """The retry snapshot is taken up front, so a row may change status underneath it."""
+    manifest.add_papers(_rows(2))
+    _fail(manifest, "2301.00000", FAILED_CONVERT)
+    _fail(manifest, "2301.00001", FAILED_CONVERT)
+    snapshot = ["2301.00000", "2301.00001"]
+
+    manifest.conn.execute("UPDATE papers SET status=? WHERE arxiv_id=?", (DONE, "2301.00001"))
+    manifest.conn.commit()
+
+    claimed = manifest.claim_ids(snapshot)
+    assert [r.arxiv_id for r in claimed] == ["2301.00000"]
+    assert manifest.stats()[DONE] == 1
+
+
+def test_a_paper_that_fails_again_is_not_retried_twice_in_one_run(manifest):
+    """One attempt per paper per run: the snapshot is consumed, never re-queried."""
+    manifest.add_papers(_rows(1))
+    _fail(manifest, "2301.00000", FAILED_CONVERT, attempts=1)
+
+    worklist = manifest.claimable_ids((FAILED_DOWNLOAD, FAILED_CONVERT), max_attempts=4)
+    assert len(manifest.claim_ids(worklist[:1])) == 1
+    del worklist[:1]
+
+    # it fails again mid-run, and is back below the ceiling...
+    _fail(manifest, "2301.00000", FAILED_CONVERT, attempts=2)
+    assert worklist == []                                   # ...but the run is done with it
+
+
 def test_writer_thread_applies_results(tmp_path):
     db = tmp_path / "m.db"
     with Manifest(db) as m:

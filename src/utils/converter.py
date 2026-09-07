@@ -19,6 +19,7 @@ absent JVM only raises if you actually select that backend.
 from __future__ import annotations
 
 import inspect
+import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -570,12 +571,101 @@ class DoclingConverter(BaseConverter):
 
     def __init__(self, cfg: Any):
         super().__init__(cfg)
-        from docling.document_converter import DocumentConverter
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.datamodel.base_models import InputFormat
 
-        self._converter = DocumentConverter()
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = False # Skip OCR
+
+        # docling's *own* deadline, and the only one that actually works here. Its
+        # pipeline runs stages on background threads, so the SIGALRM backstop in
+        # `convert_and_write` fires on the main thread while those threads keep grinding
+        # -- measured: a 5 second alarm on 0706.3792, still burning CPU 100 seconds
+        # later, and workers in the live run stuck 25 minutes against a 120 second
+        # timeout. `document_timeout` is cooperative: the stages check it and unwind.
+        # It defaults to None, i.e. no limit at all, which is what let those papers hang.
+        timeout = getattr(cfg, "timeout", None)
+        if timeout:
+            pipeline_options.document_timeout = float(timeout)
+
+        # Pin the accelerator rather than leaving it on "auto". Each worker process
+        # builds its own models and its own CUDA context (~2 GB of VRAM measured), so
+        # this is the knob that decides how many workers a GPU can hold -- and an
+        # unnoticed fall back to CPU is an order-of-magnitude difference in throughput.
+        device = getattr(cfg, "device", "auto") or "auto"
+        threads = getattr(cfg, "num_threads", None)
+        try:
+            from docling.datamodel.accelerator_options import (
+                AcceleratorDevice, AcceleratorOptions,
+            )
+            pipeline_options.accelerator_options = AcceleratorOptions(
+                device=AcceleratorDevice(device),
+                **({"num_threads": int(threads)} if threads else {}),
+            )
+        except (ImportError, ValueError) as exc:
+            # An older docling, or a device name it does not know: fall through to its
+            # own defaults rather than refusing to convert.
+            logging.getLogger(__name__).warning(
+                "docling accelerator not configured (device=%r): %s", device, exc
+            )
+
+        format_option: dict[str, Any] = {"pipeline_options": pipeline_options}
+
+        # docling's default text backend, `docling_parse`, deadlocks on some PDFs. When
+        # `document_timeout` fires, its page producer is abandoned ("did not terminate
+        # within 15.0s") and the main thread then blocks *forever* in `_unload()`, inside
+        # the docling_parse C extension. No Python-level timeout can break that: the
+        # interpreter never regains control, so SIGALRM is recorded and never delivered.
+        # That is what wedged both workers of the live run at zero throughput.
+        #
+        # Measured on 0706.3792, one of the papers that had "failed" three times:
+        #   docling_parse  hung indefinitely (killed at 25 min of CPU)
+        #   pypdfium       converted in 13.1s, 252,110 characters
+        # and on a well-behaved paper pypdfium was 1.8s vs 3.9s for the same text.
+        # Table structure comes from TableFormer either way -- this only swaps the text
+        # extractor -- so the fidelity the docling backend is chosen for is unaffected.
+        if (getattr(cfg, "pdf_backend", "pypdfium") or "pypdfium") == "pypdfium":
+            try:
+                from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+                format_option["backend"] = PyPdfiumDocumentBackend
+            except ImportError:                       # fall back to docling's default
+                logging.getLogger(__name__).warning(
+                    "pypdfium backend unavailable; using docling_parse, which can hang"
+                )
+
+        self._converter = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(**format_option)}
+        )
 
     def convert(self, pdf_path: Path) -> ConversionResult:
-        doc = self._converter.convert(str(pdf_path)).document
+        conv_res = self._converter.convert(str(pdf_path))
+
+        # `document_timeout` does not raise -- it stops work and hands back whatever was
+        # assembled so far, flagged PARTIAL_SUCCESS. Measured on 0706.3792 with a 3s
+        # timeout: 97,686 characters instead of 206,672 and **0 tables instead of 24**,
+        # which without this check would have been written out and recorded `done`.
+        # A silently half-converted paper is worse than a failed one: nothing downstream
+        # can tell it is incomplete. Raising here marks it failed and, when a
+        # `fallback_converter` is configured, hands the paper to it instead.
+        status = getattr(conv_res, "status", None)
+        if status is not None and getattr(status, "name", "") != "SUCCESS":
+            # docling reports one error *per failed page*, so a timed-out 128-page paper
+            # yields 79 copies of "document timeout exceeded" plus the one line that
+            # actually says something. Deduplicated, order preserved.
+            seen: dict[str, int] = {}
+            for err in getattr(conv_res, "errors", None) or []:
+                message = str(getattr(err, "error_message", err)).strip()
+                seen[message] = seen.get(message, 0) + 1
+            detail = "; ".join(
+                m if n == 1 else f"{m} (x{n})" for m, n in seen.items()
+            )
+            raise RuntimeError(
+                f"docling returned {getattr(status, 'name', status)}"
+                + (f": {detail}" if detail else " (likely document_timeout)")
+            )
+
+        doc = conv_res.document
         body, tables = lift_tables(
             doc.export_to_markdown(), page=0, start_index=1,
             detect_pseudocode=self.detect_pseudocode,
@@ -673,8 +763,116 @@ def _worker_converter(name: str, cfg: Any) -> BaseConverter:
     return conv
 
 
-class ConversionTimeout(RuntimeError):
-    pass
+# How often the timeout re-fires once the deadline has passed. Belt-and-braces: the
+# first one should escape now, but a swallowed timeout used to mean an unbounded run.
+TIMEOUT_REPEAT_INTERVAL = 5.0
+
+# The SIGALRM backstop deliberately trails the backend's own deadline. docling shuts its
+# stages down cooperatively (`document_timeout`, then `stage_shutdown_timeout_seconds`,
+# 15s by default); interrupting mid-unwind would turn a clean, explicable failure into a
+# torn one. These leave room for that and still bound the worst case.
+BACKSTOP_TIMEOUT_FACTOR = 1.5
+BACKSTOP_TIMEOUT_GRACE = 30.0
+
+
+class ConversionTimeout(BaseException):
+    """Deliberately **not** an `Exception`.
+
+    The timeout is raised by a SIGALRM handler part-way down a backend's own call stack,
+    and every backend wraps its work in a broad `except Exception`. docling's ends with
+
+        except Exception as e:
+            raise RuntimeError(f"Pipeline {self.__class__.__name__} failed") from e
+
+    so a timeout derived from `Exception` was caught, re-raised as an anonymous pipeline
+    error, and -- because a one-shot `signal.alarm` had already been spent -- the
+    conversion then ran on with no deadline at all. Measured on 0706.3792: a **5 second**
+    alarm, still burning CPU two minutes later; in the live run, workers grinding single
+    papers for 25 minutes against a 120 second timeout.
+
+    Inheriting from `BaseException` puts it past every `except Exception` between here
+    and the handler, which is the right semantics anyway: abandoning the document is
+    control flow, not an error the backend is invited to handle.
+    """
+
+
+def describe_exception(exc: BaseException, *, limit: int = 4) -> str:
+    """Flatten an exception and the chain it was raised from into one line.
+
+    Backends wrap failures and lose the diagnosis. docling's pipeline ends with
+
+        raise RuntimeError(f"Pipeline {self.__class__.__name__} failed") from e
+
+    and logs nothing, so recording only the outermost message leaves every failure
+    reading "RuntimeError: Pipeline StandardPdfPipeline failed" -- true, and useless.
+    The `from e` cause is where the real error lives, so it is walked and joined.
+
+    `__context__` is followed only when the raise did not suppress it, which keeps
+    incidental "during handling of the above exception" noise out.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(parts) < limit and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(f"{type(current).__name__}: {current}".strip())
+        nxt = current.__cause__
+        if nxt is None and not current.__suppress_context__:
+            nxt = current.__context__
+        current = nxt
+    return " <- caused by ".join(parts)
+
+
+def _converter_chain(convert_cfg: Any) -> list[tuple[str, bool]]:
+    """The backends to try, in order, each flagged with whether it is the last chance.
+
+    A fallback earns its place because the two backends fail on different things: the
+    model pipeline is the one that times out on long or awkward documents, and pymupdf
+    is ~100x faster and has no model, no GPU and no threads to deadlock in. A paper the
+    good backend cannot manage is better served by a plainer conversion than by nothing.
+    """
+    chain = [convert_cfg.converter]
+    fallback = getattr(convert_cfg, "fallback_converter", None)
+    if fallback and fallback not in chain:
+        chain.append(fallback)
+    return [(name, i == len(chain) - 1) for i, name in enumerate(chain)]
+
+
+def _convert_with_deadline(name: str, pdf_path: Path, convert_cfg: Any) -> ConversionResult:
+    """Run one backend under the SIGALRM backstop, then disarm it."""
+    import signal
+    import threading
+
+    # The backstop fires later than the backend's own deadline, so a backend that can
+    # unwind cleanly (docling, via `document_timeout`) gets the chance to do so and
+    # report a real error. The signal is the fallback for backends that cannot.
+    deadline = convert_cfg.timeout * BACKSTOP_TIMEOUT_FACTOR + BACKSTOP_TIMEOUT_GRACE
+
+    def _timeout(_signum: int, _frame: Any) -> None:
+        raise ConversionTimeout(
+            f"{name} exceeded {convert_cfg.timeout}s "
+            f"(backstop fired at {deadline:.0f}s)"
+        )
+
+    # `signal.signal` raises outright off the main thread, which would turn the backstop
+    # from a safety net into the thing that fails the conversion. The production path is
+    # a process pool, so this is armed there; a threaded caller simply relies on the
+    # backend's own deadline instead.
+    armed = (
+        hasattr(signal, "SIGALRM")
+        and hasattr(signal, "setitimer")
+        and threading.current_thread() is threading.main_thread()
+    )
+    if armed:
+        signal.signal(signal.SIGALRM, _timeout)
+        # A repeating timer, not a one-shot alarm. If anything downstream still contrives
+        # to swallow the first timeout, the next arrives seconds later rather than never.
+        signal.setitimer(signal.ITIMER_REAL, deadline, TIMEOUT_REPEAT_INTERVAL)
+    try:
+        return _worker_converter(name, convert_cfg).convert(pdf_path)
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 def convert_and_write(
@@ -688,56 +886,75 @@ def convert_and_write(
     pdf_sha256: str | None = None,
     keep_pdf: bool = False,
 ) -> Any:
-    """Convert one staged PDF, write the outputs, drop the PDF. Returns a `TaskResult`."""
+    """Convert one staged PDF, write the outputs, drop the PDF. Returns a `TaskResult`.
+
+    Tries `convert.converter`, then `convert.fallback_converter` if the first one fails.
+    The PDF is deleted once, after every attempt, so the fallback still has an input.
+    """
     import os
-    import signal
 
     worker_id = os.getpid()
 
     from .state import DONE, FAILED_CONVERT, TaskResult
     from .writer import write_outputs
 
-    def _timeout(_signum: int, _frame: Any) -> None:
-        raise ConversionTimeout(f"conversion exceeded {convert_cfg.timeout}s")
-
-    armed = hasattr(signal, "SIGALRM")
-    if armed:
-        signal.signal(signal.SIGALRM, _timeout)
-        signal.alarm(int(convert_cfg.timeout))
+    log_ = logging.getLogger(__name__)
+    errors: list[str] = []
 
     try:
-        converter = _worker_converter(convert_cfg.converter, convert_cfg)
-        result = converter.convert(pdf_path)
+        for name, is_last in _converter_chain(convert_cfg):
+            try:
+                result = _convert_with_deadline(name, pdf_path, convert_cfg)
 
-        # Backends that do not report a page count (markitdown) make this ratio
-        # meaningless, so the flag is simply not raised for them.
-        low_text = bool(
-            result.n_pages
-            and result.n_chars / result.n_pages < convert_cfg.min_chars_per_page
-        )
+                # Backends that do not report a page count (markitdown) make this ratio
+                # meaningless, so the flag is simply not raised for them.
+                low_text = bool(
+                    result.n_pages
+                    and result.n_chars / result.n_pages < convert_cfg.min_chars_per_page
+                )
+                md_bytes, tables_bytes = write_outputs(
+                    data_dir, row, result,
+                    # The backend that actually produced this paper, which is not
+                    # necessarily the configured one. It lands in the markdown front
+                    # matter, so "which papers took the fallback" stays answerable.
+                    converter=name,
+                    base_url=base_url,
+                )
+                if errors:
+                    log_.warning("%s converted by fallback %s after: %s",
+                                 row.arxiv_id, name, " | ".join(errors))
+                return TaskResult(
+                    arxiv_id=row.arxiv_id, status=DONE,
+                    pdf_bytes=pdf_bytes, pdf_sha256=pdf_sha256,
+                    md_bytes=md_bytes, tables_bytes=tables_bytes,
+                    n_pages=result.n_pages, n_tables=result.n_tables,
+                    n_chars=result.n_chars, low_text=low_text,
+                    count_attempt=True, worker_id=worker_id, converter=name,
+                )
 
-        md_bytes, tables_bytes = write_outputs(
-            data_dir, row, result,
-            converter=convert_cfg.converter,
-            base_url=base_url,
-        )
-        return TaskResult(
-            arxiv_id=row.arxiv_id, status=DONE,
-            pdf_bytes=pdf_bytes, pdf_sha256=pdf_sha256,
-            md_bytes=md_bytes, tables_bytes=tables_bytes,
-            n_pages=result.n_pages, n_tables=result.n_tables,
-            n_chars=result.n_chars, low_text=low_text,
-            count_attempt=True, worker_id=worker_id,
-        )
-    except BaseException as exc:  # noqa: BLE001 - any failure must be recorded, not raised
-        return TaskResult(
-            arxiv_id=row.arxiv_id, status=FAILED_CONVERT,
-            error=f"{type(exc).__name__}: {exc}"[:500],
-            pdf_bytes=pdf_bytes, pdf_sha256=pdf_sha256,
-            count_attempt=True, worker_id=worker_id,
-        )
+            except BaseException as exc:  # noqa: BLE001 - recorded, never raised
+                # The one-line summary goes to the manifest and the terminal; the full
+                # traceback goes to the log file, the only place with room for it.
+                log_.error("conversion failed: %s via %s", row.arxiv_id, name, exc_info=exc)
+                errors.append(f"{name}: {describe_exception(exc)}")
+                if isinstance(exc, ConversionTimeout):
+                    # The backend was interrupted mid-call, so whatever state it holds --
+                    # a CUDA context, a half-drained page queue -- cannot be trusted for
+                    # the next paper. Dropping the cached instance costs one model reload
+                    # and contains the damage instead of poisoning the worker's queue.
+                    _WORKER_CACHE.pop(name, None)
+                if is_last:
+                    return TaskResult(
+                        arxiv_id=row.arxiv_id, status=FAILED_CONVERT,
+                        error=" | then ".join(errors)[:500],
+                        pdf_bytes=pdf_bytes, pdf_sha256=pdf_sha256,
+                        count_attempt=True, worker_id=worker_id,
+                    )
     finally:
-        if armed:
-            signal.alarm(0)
         if not keep_pdf:
             pdf_path.unlink(missing_ok=True)
+        # Give the heap back between papers. Without this a worker's RSS climbs about
+        # 0.3 GB per document and never comes down -- see memory.release_memory.
+        from .memory import release_memory
+
+        release_memory()

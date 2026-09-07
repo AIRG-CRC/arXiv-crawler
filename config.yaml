@@ -20,15 +20,42 @@ crawl:
   # Raising `workers` increases concurrency, never the request rate past this cap.
   rate_per_sec: 1.0
   burst: 4
-  workers: 8
-  timeout: 60
-  max_attempts: 3
+  workers: 1
+  timeout: 120
+  max_attempts: 5
   chunk_size: 65536
 
 convert:
-  converter: pymupdf # pymupdf | pdfplumber | docling | opendataloader
-  workers: 8
-  timeout: 120 # seconds per PDF, before the worker is killed
+  converter: docling # pymupdf | pdfplumber | docling | opendataloader
+  # Each docling worker is a separate process with its own models and its own CUDA
+  # context. Measured on this machine: ~2.0 GB VRAM and ~3.7 GB RAM per worker, so on
+  # 16 GB of VRAM / 32 GB of RAM the ceiling is ~6 and 4 leaves comfortable headroom.
+  # Only relevant for model backends -- pymupdf is CPU-only and wants workers ~= cores.
+  workers: 4
+  device: auto # auto | cpu | cuda — pin it to catch a silent fall back to CPU
+  num_threads: null # CPU threads per worker; null derives cores // workers
+  # docling's text backend. Leave on pypdfium: docling's own "docling_parse" default
+  # deadlocks in a C extension on some PDFs, past every timeout, and wedges the worker
+  # permanently. pypdfium converted the same papers 2x faster with no loss of text.
+  pdf_backend: pypdfium # pypdfium | docling_parse
+  # Tried when the converter above fails or times out on a paper. pymupdf has no model,
+  # no GPU and no worker threads, so it fails on different things and is ~100x faster --
+  # a paper docling cannot manage is better served by a plainer conversion than by none.
+  # The backend that actually ran is recorded in each paper's markdown front matter.
+  # Set to null to disable and record such papers as failed_convert instead.
+  fallback_converter: pymupdf
+  # --- memory ---
+  # A docling worker's heap climbs ~0.3 GB per paper and never comes back on its own:
+  # glibc keeps the freed arenas rather than returning them. The worker now calls
+  # malloc_trim after every paper, which holds it flat (measured: 2.32 GB -> 2.39 GB
+  # over seven papers, versus 2.70 -> 3.68 over four without). These two settings bound
+  # what that cannot reach, so the kernel's OOM killer never gets to pick a victim --
+  # and its victim is whatever is biggest and handy, which on a desktop is your editor.
+  # 100 papers x the ~0.012 GB/paper that survives the trim bounds a worker's drift at
+  # ~1.2 GB above its ~2.4 GB working set, for one model reload (~5%) every few minutes.
+  max_tasks_per_child: 100 # retire a worker after N papers; null to keep it for the run
+  memory_floor: 0.12 # pause dispatch below this much free RAM; fraction, "4GB", or null
+  timeout: 120 # seconds per PDF, before the worker abandons it
   max_pages: 300
   table_strategy: lines_strict
   table_fallback_strategy: null
@@ -38,6 +65,20 @@ convert:
   detect_pseudocode: true
   preserve_equations: true
   max_table_columns: 25
+
+# What `run` does with papers an earlier run failed on. With `on_start`, every run opens
+# by re-attempting them -- ahead of any fresh work -- so a transient failure heals by
+# itself. `max_attempts` is the total number of tries a paper ever gets, which is what
+# stops a permanently broken PDF being re-downloaded on every run forever.
+retry:
+  on_start: true
+  max_attempts: 4
+  # Retry a paper immediately, within the same run, instead of leaving it for the next
+  # one. Worth having because the failures that survive the converter fallback tend to
+  # be transient -- a GPU under momentary pressure, a truncated download, a worker that
+  # died. `max_attempts` still caps the lifetime total, so this cannot spin.
+  in_run: true
+  in_run_attempts: 1
 
 postgres:
   dsn: null # e.g. "postgresql://user:pass@localhost:5432/arxiv"

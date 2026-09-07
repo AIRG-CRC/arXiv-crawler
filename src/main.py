@@ -18,25 +18,15 @@ from .config import Config
 from .utils import paths as P
 from .utils.checkpoint import CheckpointStore
 from .utils.crawler import run_pipeline
+from .utils.logging_setup import configure_logging
 from .utils.prepare_data import prepare
 from .utils.state import DONE, FAILED_CONVERT, FAILED_DOWNLOAD, NO_PDF, PENDING, Manifest
 
 log = logging.getLogger("arxiv_crawler")
 
-
-def _setup_logging(cfg: Config, verbose: bool) -> None:
-    cfg.paths.logs_dir.mkdir(parents=True, exist_ok=True)
-    handlers: list[logging.Handler] = [
-        logging.StreamHandler(sys.stderr),
-        logging.FileHandler(cfg.paths.logs_dir / "crawler.log", encoding="utf-8"),
-    ]
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        handlers=handlers,
-        force=True,
-    )
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
+# `run` is a progress bar, not a transcript: it logs to the file and keeps stderr clear.
+# The other commands are one-shot reports, so their handful of lines belong on stderr.
+QUIET_COMMANDS = {"run"}
 
 
 def _csv(value: str) -> list[str]:
@@ -76,17 +66,31 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         crawl_rate_per_sec=args.rps,
         crawl_burst=args.burst,
         convert_converter=args.converter,
+        retry_on_start=False if args.no_retry_failed else None,
+        retry_max_attempts=args.max_attempts,
     )
-    if cfg.crawl.contact == "your-email@example.com":
-        log.warning(
-            "crawl.contact is still the placeholder - arXiv asks automated clients to "
-            "identify themselves. Set a real address in config.yaml before a long run."
-        )
-    tallies = run_pipeline(cfg, limit=args.limit, keep_pdf=args.keep_pdf)
-    log.info(
-        "processed %(processed)s: %(done)s converted, %(no_pdf)s without a PDF, %(failed)s failed",
-        tallies,
+    if cfg.crawl.contact == "ai@crc.calvin.ac.id":
+        # Printed, not just logged, despite `run` being otherwise silent: crawling arXiv
+        # without identifying yourself is a policy problem, and a warning nobody sees is
+        # no warning at all.
+        message = ("warning: crawl.contact is still the placeholder - arXiv asks automated "
+                   "clients to identify themselves. Set a real address in config.yaml.")
+        log.warning("%s", message)
+        print(message, file=sys.stderr)
+    tallies = run_pipeline(
+        cfg, limit=args.limit, keep_pdf=args.keep_pdf, worker_bars=args.worker_bars
     )
+    summary = (
+        "processed {processed:,}: {done:,} converted, {no_pdf:,} without a PDF, "
+        "{failed:,} failed".format(**tallies)
+    )
+    if tallies.get("retried"):
+        summary += f" ({tallies['retried']:,} were retries of earlier failures)"
+    log.info("%s", summary)
+    if tallies.get("processed"):
+        print(summary)
+        if tallies.get("failed"):
+            print(f"full detail in {cfg.paths.logs_dir / 'crawler.log'}")
     return 0
 
 
@@ -206,6 +210,13 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["pymupdf", "pdfplumber", "docling", "opendataloader", "markitdown"])
     sr.add_argument("--limit", type=int, help="stop after this many papers")
     sr.add_argument("--keep-pdf", action="store_true", help="keep staged PDFs (debugging)")
+    sr.add_argument("--no-retry-failed", action="store_true",
+                    help="skip the retry pass and go straight to pending work")
+    sr.add_argument("--max-attempts", type=int,
+                    help="total tries a paper gets before the retry pass gives up "
+                         "(default: retry.max_attempts in config.yaml)")
+    sr.add_argument("--worker-bars", action="store_true",
+                    help="one progress line per conversion worker, under the main bar")
     sr.set_defaults(func=cmd_run)
 
     ss = sub.add_parser("status", help="progress report")
@@ -231,14 +242,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = Config.load(args.config)
-    _setup_logging(cfg, args.verbose)
+    configure_logging(
+        cfg.paths.logs_dir,
+        verbose=args.verbose,
+        quiet=args.command in QUIET_COMMANDS,
+    )
     try:
         return args.func(cfg, args)
     except FileNotFoundError as exc:
+        # In quiet mode nothing else reaches the terminal, so an error that stops the
+        # command has to be printed as well as logged.
         log.error("%s", exc)
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         log.warning("aborted")
+        print("aborted", file=sys.stderr)
         return 130
 
 

@@ -23,6 +23,8 @@ data/meta/2301/2301.12345.json          title, authors, date, doi, categories, .
 - [Output format](#output-format)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
+- [Retries](#retries)
+- [Terminal output](#terminal-output)
 - [Converter backends](#converter-backends)
 - [Optional: Postgres catalog](#optional-postgres-catalog)
 - [arXiv usage policy](#arxiv-usage-policy)
@@ -177,31 +179,35 @@ Written only when the paper has tables. Headings match the anchors linked from t
 ```json
 {
   "id": "1810.04805",
-  "version": "v2",
   "title": "BERT: Pre-training of Deep Bidirectional Transformers ...",
   "authors": ["Devlin, Jacob", "Chang, Ming-Wei"],
   "date_released": "2018-10-11",
   "date_updated": "2019-05-24",
   "doi": null,
-  "journal_ref": null,
   "categories": ["cs.CL", "cs.LG"],
   "primary_category": "cs.CL",
-  "license": null,
-  "abstract": "We introduce a new language representation model ...",
   "source_url": "https://export.arxiv.org/abs/1810.04805v2",
-  "n_pages": 16, "n_tables": 3, "n_chars": 65775,
-  "truncated": false, "low_text": false,
-  "pdf_bytes": 775166,
-  "pdf_sha256": "5692a5514787a8c6727b4ff3b726a3385798bc68e12138d1d4af83947e2acf6e",
+  "n_pages": 16,
+  "n_tables": 3,
+  "n_chars": 65775,
   "md_path": "md/1810/1810.04805.md",
-  "tables_path": "tables/1810/1810.04805.tables.md",
-  "converter": "pymupdf",
-  "converted_at": "2026-09-01T10:11:04+00:00"
+  "tables_path": "tables/1810/1810.04805.tables.md"
 }
 ```
 
-`date_released` is v1's submission date; `date_updated` is the latest version's. `pdf_sha256` and
-`pdf_bytes` are kept because the PDF itself is not.
+`date_released` is v1's submission date; `date_updated` is the latest version's.
+`tables_path` is `null` when the paper has no tables.
+
+That field list is exhaustive and enforced — `build_metadata` asserts against
+`writer.METADATA_FIELDS`, so the set cannot drift silently. Everything else stays in the
+manifest rather than being copied into 2.8M files: crawl bookkeeping (`attempts`, `error`,
+`status`), the size and checksum of the discarded PDF (`pdf_bytes`, `pdf_sha256`), and the
+per-conversion flags (`truncated`, `low_text`, `converter`). Query those with `status`,
+`compare_size`, or SQL against `manifest.db`.
+
+The snapshot's `abstract`, `journal-ref` and `license` are **not carried at all** — not into
+the manifest, the metadata JSON, or the Postgres schema. If you need abstracts, they are in
+the Kaggle snapshot, keyed by the same `id`.
 
 Every file is written to a temporary name and then `os.replace`d into place, so an interrupted run
 leaves either the old file or the new one — never a half-written file a resumed run would mistake
@@ -222,9 +228,14 @@ reproducible rather than tracking a moving `/pdf/<id>`.
 ```bash
 python -m src.main run [--download-workers N] [--convert-workers M] [--rps R] [--burst B]
                        [--converter NAME] [--limit N] [--keep-pdf]
+                       [--no-retry-failed] [--max-attempts N] [--worker-bars]
 ```
 Downloads and converts in parallel. `Ctrl-C` once to stop cleanly (in-flight work finishes, staged
 PDFs are cleared, the manifest is left consistent); twice to abort.
+
+Every run **opens with the papers an earlier run failed on**, ahead of any fresh work, so a
+transient failure heals by itself — see [Retries](#retries). `--worker-bars` adds one progress
+line per conversion worker under the main bar.
 
 ```bash
 python -m src.main status     # counts by status, output size, tables extracted
@@ -260,8 +271,58 @@ All defaults live in [`config.yaml`](config.yaml); CLI flags override them per f
 | `convert.table_strategy` | `lines_strict` | See [Converter backends](#converter-backends). |
 | `convert.table_fallback_strategy` | `null` | Leave off — see the note in `config.yaml`. |
 | `convert.min_chars_per_page` | `100` | Below this a paper is flagged `low_text`. |
+| `retry.on_start` | `true` | Re-attempt earlier failures at the start of every `run`. |
+| `retry.max_attempts` | `4` | Total tries a paper ever gets before `run` stops picking it up. |
 
 Raising `crawl.workers` increases concurrency, **never** the request rate past `rate_per_sec`.
+
+---
+
+## Retries
+
+A paper that fails is not abandoned. Each `run` begins by re-attempting every `failed_download`
+and `failed_convert` row still under `retry.max_attempts`, and only then moves on to `pending`
+work. Retries go first because they are the smaller, more informative set: if the last run failed
+because the converter's dependency was missing, you find out in the first few seconds rather than
+after another hour of new downloads.
+
+Three properties make that safe to leave on:
+
+- **One attempt per paper per run.** The retry worklist is snapshotted before dispatch begins, so
+  a paper that fails again mid-run is not immediately picked up and retried inside the same run.
+- **`attempts` is always incremented**, including when a conversion worker dies outright. A PDF
+  that segfaults the C extension therefore exhausts its attempts and stops being re-downloaded,
+  instead of crashing a worker on every run forever.
+- **Terminal failures are excluded.** `no_pdf` (404: withdrawn or source-only) is a fact, not an
+  error, and is never retried.
+
+Once a paper is out of attempts, `run` says so and leaves it alone. `retry --max-attempts N`
+raises the ceiling and re-queues it explicitly, and `--no-retry-failed` skips the pass entirely
+for a run that should only chew through fresh work.
+
+> A `failed_convert` retry **re-downloads**, because the PDF is deleted after every attempt. That
+> costs a request against the rate limit, so the attempt ceiling is doing real work.
+
+---
+
+## Terminal output
+
+`run` prints a progress bar and nothing else. Anything worth keeping goes to
+`data/logs/crawler.log`:
+
+```
+retrying 29 previously failed paper(s) first
+crawl+convert:  38%|███▊      | 18,904/49,141 [2:14:07<3:34:19, 2.35paper/s, ok=18,871, fail=33, w=8]
+  ✗ 0802.2167  ConversionTimeout: conversion exceeded 120s
+```
+
+Failures are the one exception — the id and its error print above the bar as they happen, written
+through `tqdm.write` so they cannot corrupt it. Everything else is suppressed, including the
+per-paper INFO chatter from `docling` that otherwise runs to four lines per paper in every worker
+process (one observed log reached 67 MB). Third-party loggers are capped at `WARNING` in the log
+file and silenced entirely in conversion workers.
+
+`-v` puts the full stream back on stderr when you actually want to watch it.
 
 ---
 
@@ -324,8 +385,8 @@ re-running after more papers convert is safe.
 
 Postgres rather than MySQL because this table wants three things MySQL lacks or fakes: `TEXT[]`
 for categories with a GIN index, `JSONB` for the untruncated record, and built-in full-text search
-over abstracts. See [`src/scripts/schema.sql`](src/scripts/schema.sql) for the DDL and example
-queries.
+— here over titles, since abstracts are not carried. See
+[`src/scripts/schema.sql`](src/scripts/schema.sql) for the DDL and example queries.
 
 ```sql
 SELECT primary_category, count(*) FROM papers GROUP BY 1 ORDER BY 2 DESC;
@@ -391,10 +452,12 @@ figure-heavy one).
 **Interrupting is safe.** `Ctrl-C` once: in-flight work finishes, staged PDFs are cleaned up, and
 rows left `in_flight` are returned to `pending` on the next start. Just run `run` again.
 
-**Something failed.** `status` shows the breakdown; the manifest keeps a per-paper `error`.
+**Something failed.** The next `run` retries it automatically ([Retries](#retries)). `status` shows
+the breakdown, and the manifest keeps a per-paper `error`. To force papers that are out of
+attempts back into the queue:
 
 ```bash
-.venv/bin/python -m src.main retry --stage download
+.venv/bin/python -m src.main retry --stage download --max-attempts 8
 ```
 
 **Outputs deleted by accident.**
@@ -448,6 +511,7 @@ src/
 ├── config.py                  config.yaml -> dataclasses, with CLI overrides
 ├── utils/
 │   ├── paths.py               ID normalisation and the yymm shard layout
+│   ├── logging_setup.py       file-only logging; silences workers so the bar survives
 │   ├── state.py               SQLite manifest, claim/writer machinery
 │   ├── prepare_data.py        streaming JSONL ingest (shared with the notebook)
 │   ├── crawler.py             rate limiter, HTTP layer, parallel orchestrator

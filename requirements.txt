@@ -15,5 +15,5 @@ pytest>=8.0
 psycopg[binary]>=3.1      # src/scripts/ingest_postgres.py
 pdfplumber>=0.11          # --converter pdfplumber      (MIT alternative)
 docling>=2.0              # --converter docling         (slow, best tables)
-opendataloader-pdf>=2.0   # --converter opendataloader  (requires JDK 11+)
+# opendataloader-pdf>=2.0   # --converter opendataloader  (requires JDK 11+)
 markitdown>=0.1

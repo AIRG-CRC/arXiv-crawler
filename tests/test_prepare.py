@@ -30,13 +30,26 @@ RECORD = {
 def test_parse_record_normalises_the_fields_we_keep():
     p = parse_record(RECORD)
     assert p["id"] == "0704.0001"
+    assert p["version"] == "v2"
     assert p["title"] == "Calculation of prompt diphoton production cross sections"
-    assert p["abstract"] == "A fully differential calculation."
     assert p["authors"] == ["Balázs, C.", "Berger, E. L. Jr"]
     assert p["categories"] == ["hep-ph", "cs.LG"]
     assert p["primary_category"] == "hep-ph"
     assert p["doi"] == "10.1103/PhysRevD.76.013009"
-    assert p["journal_ref"] == "Phys.Rev.D76:013009,2007"
+
+
+def test_parse_record_drops_the_fields_we_do_not_carry():
+    """`journal-ref`, `license` and `abstract` are in the snapshot and stay there.
+
+    RECORD deliberately still supplies all three, so this pins the decision rather than
+    letting it drift back in: nothing downstream -- manifest, metadata JSON, Postgres
+    schema -- has a home for them, and a field carried but never written is just weight
+    on 2.8M rows.
+    """
+    p = parse_record(RECORD)
+    assert "abstract" not in p
+    assert "journal_ref" not in p
+    assert "license" not in p
 
 
 def test_version_pinning_picks_the_highest_not_the_last():

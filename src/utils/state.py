@@ -30,11 +30,8 @@ CREATE TABLE IF NOT EXISTS papers (
   categories       TEXT,      -- space-separated, as arXiv publishes it
   primary_category TEXT,
   doi              TEXT,
-  journal_ref      TEXT,
-  license          TEXT,
   date_released    TEXT,      -- v1 submission date, ISO
   date_updated     TEXT,      -- latest version date, ISO
-  abstract         TEXT,
   status           TEXT NOT NULL DEFAULT 'pending',
   pdf_bytes        INTEGER,
   pdf_sha256       TEXT,
@@ -54,9 +51,13 @@ CREATE INDEX IF NOT EXISTS idx_papers_cat    ON papers(primary_category);
 
 _ROW_COLUMNS = (
     "arxiv_id", "version", "shard", "title", "authors", "categories",
-    "primary_category", "doi", "journal_ref", "license",
-    "date_released", "date_updated", "abstract",
+    "primary_category", "doi", "date_released", "date_updated"
 )
+
+# What a claim hands back. `attempts` is read but never inserted -- it is maintained by
+# the writer -- so it cannot live in _ROW_COLUMNS, which drives the INSERT. The
+# orchestrator needs it to decide whether a paper that just failed has tries left.
+_CLAIM_COLUMNS = _ROW_COLUMNS + ("attempts",)
 
 
 @dataclass
@@ -71,9 +72,10 @@ class PaperRow:
     authors: str = "[]"
     categories: str = ""
     primary_category: str = ""
-    doi: str | None = None 
+    doi: str | None = None
     date_released: str | None = None
     date_updated: str | None = None
+    attempts: int = 0         # tries already spent, as of the moment it was claimed
 
     @property
     def author_list(self) -> list[str]:
@@ -105,6 +107,7 @@ class TaskResult:
     low_text: bool = False
     count_attempt: bool = False
     worker_id: int = 0        # pid of the process that handled it; for checkpoints
+    converter: str = ""       # the backend that actually produced it, fallback included
 
 
 def _utcnow() -> str:
@@ -171,20 +174,82 @@ class Manifest:
         return cur.rowcount
 
     # Worker helper function --> No duplicate task handling between workers
-    def claim_batch(self, n: int, statuses: tuple[str, ...] = (PENDING,)) -> list[PaperRow]:
+    def claim_batch(
+        self,
+        n: int,
+        statuses: tuple[str, ...] = (PENDING,),
+        *,
+        max_attempts: int | None = None,
+    ) -> list[PaperRow]:
         """Atomically move up to `n` rows to `in_flight` and return them.
 
         The UPDATE...RETURNING is a single statement, so two claimers can never hand the
         same paper to two workers even if the dispatcher is ever parallelised.
+
+        `max_attempts` caps how many times a paper may be handed out in total. It is what
+        keeps the retry-first pass from re-downloading a permanently broken PDF on every
+        single run; `pending` rows have `attempts = 0`, so it is a no-op for fresh work.
         """
         placeholders = ", ".join("?" * len(statuses))
+        ceiling = "" if max_attempts is None else " AND attempts < ?"
         sql = (
             f"UPDATE papers SET status = ? WHERE arxiv_id IN ("
-            f"  SELECT arxiv_id FROM papers WHERE status IN ({placeholders}) LIMIT ?"
-            f") RETURNING {', '.join(_ROW_COLUMNS)}"
+            f"  SELECT arxiv_id FROM papers WHERE status IN ({placeholders}){ceiling} LIMIT ?"
+            f") RETURNING {', '.join(_CLAIM_COLUMNS)}"
         )
+        params: tuple = (IN_FLIGHT, *statuses)
+        if max_attempts is not None:
+            params += (max_attempts,)
         with self.conn:
-            cur = self.conn.execute(sql, (IN_FLIGHT, *statuses, n))
+            cur = self.conn.execute(sql, (*params, n))
+            return [PaperRow(**dict(r)) for r in cur.fetchall()]
+
+    def count_claimable(
+        self, statuses: tuple[str, ...], *, max_attempts: int | None = None
+    ) -> int:
+        """How many rows `claim_batch` would eventually hand out for these statuses."""
+        placeholders = ", ".join("?" * len(statuses))
+        ceiling = "" if max_attempts is None else " AND attempts < ?"
+        params: tuple = statuses if max_attempts is None else (*statuses, max_attempts)
+        return self.conn.execute(
+            f"SELECT COUNT(*) FROM papers WHERE status IN ({placeholders}){ceiling}",
+            params,
+        ).fetchone()[0]
+
+    def claimable_ids(
+        self, statuses: tuple[str, ...], *, max_attempts: int | None = None
+    ) -> list[str]:
+        """The ids `claim_batch` would hand out, read once and up front.
+
+        The retry pass takes this snapshot before it dispatches anything. A paper that
+        fails *again* mid-run goes straight back to `failed_convert`, and without a fixed
+        worklist the very next claim would pick it up and retry it inside the same run,
+        round and round. Naming the ids in advance makes "one attempt per paper per run"
+        a property of the dispatch rather than a race that usually works out.
+        """
+        placeholders = ", ".join("?" * len(statuses))
+        ceiling = "" if max_attempts is None else " AND attempts < ?"
+        params: tuple = statuses if max_attempts is None else (*statuses, max_attempts)
+        return [
+            r[0] for r in self.conn.execute(
+                f"SELECT arxiv_id FROM papers WHERE status IN ({placeholders}){ceiling}",
+                params,
+            )
+        ]
+
+    def claim_ids(self, ids: list[str], statuses: tuple[str, ...] = RETRYABLE) -> list[PaperRow]:
+        """Claim named rows, skipping any whose status moved on since the snapshot."""
+        if not ids:
+            return []
+        id_slots = ", ".join("?" * len(ids))
+        status_slots = ", ".join("?" * len(statuses))
+        with self.conn:
+            cur = self.conn.execute(
+                f"UPDATE papers SET status = ? "
+                f"WHERE arxiv_id IN ({id_slots}) AND status IN ({status_slots}) "
+                f"RETURNING {', '.join(_CLAIM_COLUMNS)}",
+                (IN_FLIGHT, *ids, *statuses),
+            )
             return [PaperRow(**dict(r)) for r in cur.fetchall()]
 
     def reset_stale(self) -> int:

@@ -19,10 +19,8 @@ def row():
         title="A Study of Things",
         authors=json.dumps(["Doe, Jane", "Roe, Richard"]),
         categories="cs.LG stat.ML", primary_category="cs.LG",
-        doi="10.1000/xyz", journal_ref="J. Things 1:2,2023",
-        license="http://creativecommons.org/licenses/by/4.0/",
+        doi="10.1000/xyz",
         date_released="2023-01-25", date_updated="2023-01-30",
-        abstract="We study things.",
     )
 
 
@@ -62,8 +60,13 @@ def test_metadata_values(row, result):
     assert meta["tables_path"] == "tables/2301/2301.12345.tables.md"
 
 
+# Every name here is something the writer *has* in hand and deliberately leaves out:
+# `version` and `truncated` come off the inputs, the rest are manifest-only bookkeeping.
+# `journal_ref`, `license` and `abstract` used to be on this list; they are no longer
+# carried anywhere in the pipeline, so asserting their absence here would prove nothing.
+# The exact field set is pinned by test_metadata_contains_exactly_the_agreed_fields.
 @pytest.mark.parametrize("dropped", [
-    "version", "journal_ref", "license", "abstract", "truncated", "low_text",
+    "version", "truncated", "low_text",
     "pdf_bytes", "pdf_sha256", "converter", "converted_at",
 ])
 def test_dropped_fields_really_are_gone(row, result, dropped):

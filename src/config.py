@@ -87,17 +87,17 @@ class Crawl:
     contact: str = "ai@crc.calvin.ac.id"
     rate_per_sec: float = 1.0
     burst: int = 4
-    workers: int = 4
+    workers: int = 1
     timeout: int = 60
-    max_attempts: int = 4
+    max_attempts: int = 5
     chunk_size: int = 65536
 
 
 @dataclass
 class Convert:
     """Defines the conversion status"""
-    converter: str = "pymupdf"
-    workers: int | None = 8
+    converter: str = "docling"
+    workers: int | None = 1
     timeout: int = 120
     max_pages: int = 300
     table_strategy: str = "lines_strict"
@@ -106,10 +106,50 @@ class Convert:
     detect_pseudocode: bool = True
     preserve_equations: bool = True
     max_table_columns: int = 25
+    # Model backends only (docling). "auto" lets the library choose; naming the device
+    # makes a silent fall back to CPU -- which costs an order of magnitude -- visible.
+    device: str = "auto"
+    # CPU threads *per worker*. Left unset it is derived from the core count so that
+    # workers x threads does not oversubscribe: docling defaults to 4 threads each, so
+    # 6 workers on an 8-core box would ask for 24.
+    num_threads: int | None = None
+    # docling's text-extraction backend. "docling_parse" is docling's own default and
+    # can deadlock past any timeout; see DoclingConverter for the measurement.
+    pdf_backend: str = "pypdfium"
+    # Tried when `converter` fails or times out on a paper. null disables it, and the
+    # paper is then recorded as failed_convert exactly as before.
+    fallback_converter: str | None = "pymupdf"
+    # Recycle a conversion worker after this many papers, so any growth the per-paper
+    # heap release cannot reclaim is bounded by construction. Costs one model reload.
+    # null keeps workers for the whole run.
+    max_tasks_per_child: int | None = 100
+    # Stop dispatching new papers while free memory is below this. A fraction of total
+    # RAM (0.12), an absolute size ("4GB"), or null to disable the guard.
+    memory_floor: float | str | None = 0.12
 
     def __post_init__(self) -> None:
         if not self.workers:
             self.workers = os.cpu_count() or 4
+        if not self.num_threads:
+            self.num_threads = max(1, (os.cpu_count() or 4) // max(self.workers, 1))
+
+
+@dataclass
+class Retry:
+    """What `run` does with papers a previous run failed on.
+
+    `on_start` makes every run open with a pass over the retryable failures before it
+    touches fresh work, so a failure caused by something transient -- a missing optional
+    dependency, a truncated download, a converter since fixed -- heals on the next run
+    instead of waiting for someone to remember `retry`.
+    """
+    on_start: bool = True
+    max_attempts: int = 4
+    # Retry a paper *within the same run* rather than leaving it for the next one.
+    # `in_run_attempts` is how many extra tries it gets before the run gives up on it;
+    # `max_attempts` still caps the lifetime total, so this cannot loop.
+    in_run: bool = True
+    in_run_attempts: int = 1
 
 
 @dataclass
@@ -125,11 +165,12 @@ class Config:
     scope: Scope = field(default_factory=Scope)
     crawl: Crawl = field(default_factory=Crawl)
     convert: Convert = field(default_factory=Convert)
+    retry: Retry = field(default_factory=Retry)
     postgres: Postgres = field(default_factory=Postgres)
 
     SECTIONS: ClassVar[dict[str, type]] = {
         "paths": Paths, "scope": Scope, "crawl": Crawl,
-        "convert": Convert, "postgres": Postgres,
+        "convert": Convert, "retry": Retry, "postgres": Postgres,
     }
 
     @classmethod
