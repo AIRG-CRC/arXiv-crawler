@@ -246,6 +246,7 @@ def run_pipeline(
     limit: int | None = None,
     keep_pdf: bool = False,
     worker_bars: bool = False,
+    retry_all: bool = False,
 ) -> dict[str, int]:
     """Drive download -> convert -> manifest until the queue drains or Ctrl-C arrives.
 
@@ -265,7 +266,11 @@ def run_pipeline(
     # The retry worklist is fixed here, before anything is dispatched -- see
     # Manifest.claimable_ids for why it is a snapshot and not a repeated query.
     retry_cfg = getattr(cfg, "retry", None)
-    max_attempts = getattr(retry_cfg, "max_attempts", 4)
+    # `None` means no ceiling: every failed paper is retried on every run. That is what
+    # `--retry-all` and `retry.max_attempts: null` both select. Worth having because on
+    # this project every "permanent" failure so far turned out to be a fixable bug, and
+    # a lifetime cap would have locked those papers out of the run that fixed them.
+    max_attempts = None if retry_all else getattr(retry_cfg, "max_attempts", 4)
     in_run_enabled = bool(getattr(retry_cfg, "in_run", True))
     retry_ids: list[str] = []
     if getattr(retry_cfg, "on_start", True):
@@ -283,10 +288,28 @@ def run_pipeline(
         manifest.close()
         return dict(EMPTY_TALLIES)
 
-    if retry_ids:
-        console(f"retrying {len(retry_ids):,} previously failed paper(s) first")
-        log.info("retry-first pass: %d paper(s) below the %d-attempt ceiling",
-                 len(retry_ids), max_attempts)
+    # Always say what the retry pass decided, even when the answer is "nothing". A silent
+    # start is indistinguishable from a broken one, and a paper held back by the attempt
+    # ceiling was previously invisible: the explanation only appeared in the "nothing to
+    # do" branch, which never fires while millions of papers are still pending.
+    total_failed = manifest.count_claimable(RETRYABLE)
+    if not getattr(retry_cfg, "on_start", True):
+        if total_failed:
+            console("retry: %s failed paper(s) left alone (retry.on_start is off)",
+                    f"{total_failed:,}")
+    elif retry_ids:
+        console("retry: %s previously failed paper(s) queued first",
+                f"{len(retry_ids):,}")
+        log.info("retry-first pass: %d of %d failed paper(s), ceiling %s",
+                 len(retry_ids), total_failed, max_attempts)
+    else:
+        console("retry: no failed papers to retry")
+
+    stuck = total_failed - len(retry_ids)
+    if stuck > 0:
+        console("retry: %s failed paper(s) skipped — out of attempts (retry.max_attempts"
+                "=%s); `run --retry-all` to try them anyway", f"{stuck:,}", max_attempts)
+        log.info("%d paper(s) above the attempt ceiling", stuck)
 
     stop = threading.Event()
     previous_sigint = signal.getsignal(signal.SIGINT)
@@ -335,7 +358,13 @@ def run_pipeline(
     in_run_used: dict[str, int] = {}
     in_run_budget = getattr(retry_cfg, "in_run_attempts", 1) if in_run_enabled else 0
     fresh_dispatched = 0        # newly claimed rows in the last _claim; see the loop
-    live_workers: set[int] = set()   # pids that have finished a paper in *this* run
+
+    def _live_workers() -> int:
+        """How many conversion processes the pool currently has. Best-effort: the
+        attribute is private, so an unexpected shape falls back to the configured count
+        rather than putting a wrong number on the bar."""
+        processes = getattr(cv_pool, "_processes", None)
+        return len(processes) if processes else cfg.convert.workers
 
     def _try_again_this_run(row: PaperRow, result: TaskResult) -> bool:
         """Should this failure go back on the queue instead of being recorded as final?
@@ -352,7 +381,9 @@ def run_pipeline(
         used = in_run_used.get(row.arxiv_id, 0)
         if used >= in_run_budget:
             return False
-        if row.attempts + used + 1 >= max_attempts:
+        # `max_attempts is None` means no lifetime ceiling, so only the per-run budget
+        # above applies -- which still terminates, because it is finite.
+        if max_attempts is not None and row.attempts + used + 1 >= max_attempts:
             return False
         in_run_used[row.arxiv_id] = used + 1
         return True
@@ -394,15 +425,14 @@ def run_pipeline(
         checkpoints.bump(result.worker_id or os.getpid(), result.status, result.arxiv_id)
         if result.worker_id:
             bars.bump(result.worker_id, result.arxiv_id)
-            live_workers.add(result.worker_id)
         totals = checkpoints.totals()
-        # `w` is workers seen working *in this run* over the number configured. It used to
-        # be checkpoints.totals().workers, which counts accumulated worker-NN.json files
-        # -- those carry over from every interrupted run and are only cleared on a clean
-        # finish, so it read "w=17" on a two-worker run. That was measuring history, not
-        # concurrency.
+        # `w` is live workers over the number configured. Two earlier versions of this
+        # were both wrong: checkpoints.totals().workers counts accumulated worker-NN.json
+        # files, which carry over between runs ("w=17" on a two-worker run), and counting
+        # distinct pids seen this run overshoots as soon as `max_tasks_per_child` starts
+        # recycling them ("w=8/4"). The pool's own process table is the live answer.
         bar.set_postfix(ok=totals.done, fail=totals.failed,
-                        w=f"{len(live_workers)}/{cfg.convert.workers}", refresh=False)
+                        w=f"{_live_workers()}/{cfg.convert.workers}", refresh=False)
         bar.update(1)
 
     def _download(row: PaperRow) -> tuple[PaperRow, DownloadOutcome]:
@@ -453,7 +483,12 @@ def run_pipeline(
     # `max_tasks_per_child` retires a worker after N papers and starts a fresh one, so
     # whatever the per-paper heap release cannot reclaim cannot accumulate for a whole
     # run either. Only supported from Python 3.11.
-    pool_kwargs: dict[str, Any] = {"initializer": quiet_worker_logging}
+    # The log path is passed explicitly: under spawn a worker inherits nothing, so it
+    # cannot discover where the parent is logging.
+    pool_kwargs: dict[str, Any] = {
+        "initializer": quiet_worker_logging,
+        "initargs": (str(cfg.paths.logs_dir / "crawler.log"),),
+    }
     recycle_after = getattr(cfg.convert, "max_tasks_per_child", None)
     if recycle_after:
         try:

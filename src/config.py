@@ -144,7 +144,10 @@ class Retry:
     instead of waiting for someone to remember `retry`.
     """
     on_start: bool = True
-    max_attempts: int = 4
+    # Lifetime cap on how many times a paper is ever handed out. `null` means no cap:
+    # every failed paper is retried on every run, which is what you want while the
+    # failures are still being diagnosed, at the cost of re-downloading hopeless ones.
+    max_attempts: int | None = 4
     # Retry a paper *within the same run* rather than leaving it for the next one.
     # `in_run_attempts` is how many extra tries it gets before the run gives up on it;
     # `max_attempts` still caps the lifetime total, so this cannot loop.

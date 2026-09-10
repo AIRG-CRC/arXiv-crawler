@@ -74,12 +74,24 @@ def configure_logging(logs_dir: Path, *, verbose: bool = False, quiet: bool = Tr
             logging.getLogger(name).setLevel(logging.WARNING)
 
 
-def quiet_worker_logging() -> None:
+_worker_log_stream = None       # kept alive: the fds below are dup'd from it
+
+
+def quiet_worker_logging(log_path: str | None = None) -> None:
     """`ProcessPoolExecutor` initializer: shut a conversion worker up.
 
-    Runs once per worker process. Under `fork` it undoes the inherited console handler;
-    under `spawn` it configures a process that has no handlers yet. Either way the worker
-    reports outcomes through the `TaskResult` it returns, never through the terminal.
+    Runs once per worker process, and it must not assume anything was inherited.
+    `convert.max_tasks_per_child` forces the pool onto the **spawn** start method --
+    CPython's own words: "Requires a non-'fork' mp_context start method. When given, we
+    default to using 'spawn'" -- so a worker starts with an empty logging config rather
+    than the parent's. Left alone, every ERROR then fell through to `logging.lastResort`,
+    which prints unformatted to stderr: full tracebacks over the progress bar, and
+    nothing in the log file at all.
+
+    So the worker is given its own file handler, `lastResort` is removed, and fds 1 and 2
+    are pointed at the same file. That last part matters because not all of the noise
+    comes through `logging`: pymupdf4llm `print`s advice about `pymupdf_layout`, and
+    pypdfium writes from C, neither of which a logging handler can intercept.
     """
     # tqdm honours this from the environment, which is how docling's internal page bars
     # are suppressed without reaching into its API. Set inside the child only, so the
@@ -95,6 +107,27 @@ def quiet_worker_logging() -> None:
         if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
             root.removeHandler(handler)
     root.setLevel(logging.ERROR)
+
+    if log_path:
+        global _worker_log_stream
+        try:
+            if not any(isinstance(h, logging.FileHandler) for h in root.handlers):
+                handler = logging.FileHandler(log_path, encoding="utf-8")
+                handler.setFormatter(logging.Formatter(LOG_FORMAT))
+                root.addHandler(handler)
+            # Catch what logging cannot: `print` from pymupdf4llm, writes from the
+            # pypdfium and docling C extensions. Redirecting the file descriptors
+            # themselves is the only thing that covers native code.
+            if _worker_log_stream is None:
+                _worker_log_stream = open(log_path, "a", buffering=1, encoding="utf-8")
+                os.dup2(_worker_log_stream.fileno(), 1)
+                os.dup2(_worker_log_stream.fileno(), 2)
+        except OSError:
+            pass                            # an unwritable log must not fail the worker
+
+    # With no handler configured, logging falls back to an unformatted stderr writer.
+    # In a worker that means the terminal, so it is removed outright.
+    logging.lastResort = None
 
     # Raising the root level is not enough on its own. A logger only defers to root when
     # its own level is NOTSET, and docling's table matcher configures itself -- so

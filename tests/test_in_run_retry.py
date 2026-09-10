@@ -115,3 +115,63 @@ def test_in_run_retry_can_be_switched_off(pipeline, monkeypatch):
 
     assert calls["2301.00001"] == 1
     assert tallies["failed"] == 1 and "in_run_retries" not in tallies
+
+
+# --- the cross-run pass, and its attempt ceiling -----------------------------------------
+def _failed(cfg, arxiv_id, attempts):
+    with Manifest(cfg.paths.manifest_db) as m:
+        m.conn.execute("UPDATE papers SET status = ?, attempts = ? WHERE arxiv_id = ?",
+                       (FAILED_CONVERT, attempts, arxiv_id))
+        m.conn.commit()
+
+
+def test_failed_papers_are_retried_first_on_the_next_run(pipeline, monkeypatch):
+    order: list[str] = []
+    monkeypatch.setattr(C, "convert_and_write", _converter({}, {}))
+    real_download = C.download_one
+    monkeypatch.setattr(C, "download_one", lambda row, *a: (
+        order.append(row.arxiv_id), real_download(row, *a))[1])
+
+    _seed(pipeline, ["2301.00001", "2301.00002", "2301.00003"])
+    _failed(pipeline, "2301.00003", attempts=1)      # the only failure, seeded last
+
+    tallies = C.run_pipeline(pipeline)
+
+    assert order[0] == "2301.00003", "the failed paper must go before pending work"
+    assert tallies["retried"] == 1
+    with Manifest(pipeline.paths.manifest_db) as m:
+        assert m.stats()[DONE] == 3
+
+
+def test_a_paper_out_of_attempts_is_left_alone_by_default(pipeline, monkeypatch):
+    monkeypatch.setattr(C, "convert_and_write", _converter({}, {}))
+    _seed(pipeline, ["2301.00001"])
+    _failed(pipeline, "2301.00001", attempts=4)      # at the default ceiling
+
+    tallies = C.run_pipeline(pipeline)
+
+    assert tallies["processed"] == 0 and tallies["retried"] == 0
+    with Manifest(pipeline.paths.manifest_db) as m:
+        assert m.stats()[FAILED_CONVERT] == 1
+
+
+def test_retry_all_ignores_the_ceiling(pipeline, monkeypatch):
+    """`--retry-all`: every failure gets another go, however many it has already had."""
+    monkeypatch.setattr(C, "convert_and_write", _converter({}, {}))
+    _seed(pipeline, ["2301.00001"])
+    _failed(pipeline, "2301.00001", attempts=9)
+
+    tallies = C.run_pipeline(pipeline, retry_all=True)
+
+    assert tallies["retried"] == 1 and tallies["done"] == 1
+    with Manifest(pipeline.paths.manifest_db) as m:
+        assert m.stats()[DONE] == 1
+
+
+def test_a_null_ceiling_in_config_means_always_retry(pipeline, monkeypatch):
+    monkeypatch.setattr(C, "convert_and_write", _converter({}, {}))
+    pipeline.retry.max_attempts = None
+    _seed(pipeline, ["2301.00001"])
+    _failed(pipeline, "2301.00001", attempts=9)
+
+    assert C.run_pipeline(pipeline)["retried"] == 1

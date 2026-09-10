@@ -69,6 +69,9 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         retry_on_start=False if args.no_retry_failed else None,
         retry_max_attempts=args.max_attempts,
     )
+    if args.retry_all:
+        # `override` skips None values, so the "no ceiling" case is set directly.
+        cfg.retry.max_attempts = None
     if cfg.crawl.contact == "ai@crc.calvin.ac.id":
         # Printed, not just logged, despite `run` being otherwise silent: crawling arXiv
         # without identifying yourself is a policy problem, and a warning nobody sees is
@@ -78,7 +81,8 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         log.warning("%s", message)
         print(message, file=sys.stderr)
     tallies = run_pipeline(
-        cfg, limit=args.limit, keep_pdf=args.keep_pdf, worker_bars=args.worker_bars
+        cfg, limit=args.limit, keep_pdf=args.keep_pdf, worker_bars=args.worker_bars,
+        retry_all=args.retry_all,
     )
     summary = (
         "processed {processed:,}: {done:,} converted, {no_pdf:,} without a PDF, "
@@ -212,6 +216,8 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--keep-pdf", action="store_true", help="keep staged PDFs (debugging)")
     sr.add_argument("--no-retry-failed", action="store_true",
                     help="skip the retry pass and go straight to pending work")
+    sr.add_argument("--retry-all", action="store_true",
+                    help="retry every failed paper, ignoring the attempt ceiling")
     sr.add_argument("--max-attempts", type=int,
                     help="total tries a paper gets before the retry pass gives up "
                          "(default: retry.max_attempts in config.yaml)")

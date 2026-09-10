@@ -55,7 +55,7 @@ convert:
   # ~1.2 GB above its ~2.4 GB working set, for one model reload (~5%) every few minutes.
   max_tasks_per_child: 100 # retire a worker after N papers; null to keep it for the run
   memory_floor: 0.12 # pause dispatch below this much free RAM; fraction, "4GB", or null
-  timeout: 120 # seconds per PDF, before the worker abandons it
+  timeout: 600 # seconds per PDF, before the worker abandons it
   max_pages: 300
   table_strategy: lines_strict
   table_fallback_strategy: null
