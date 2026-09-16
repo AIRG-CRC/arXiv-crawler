@@ -221,6 +221,64 @@ def mark_equations(markdown: str) -> str:
     return "\n".join(out)
 
 
+# --- HTML tables -----------------------------------------------------------------------
+_HTML_TABLE = re.compile(r"<table\b.*?</table>", re.I | re.S)
+_HTML_ROW = re.compile(r"<tr\b.*?</tr>", re.I | re.S)
+_HTML_CELL = re.compile(r"<t[hd]\b([^>]*)>(.*?)</t[hd]>", re.I | re.S)
+_HTML_TAG = re.compile(r"<[^>]+>")
+_SPAN = re.compile(r'\b(?:col|row)span\s*=\s*["\']?(\d+)', re.I)
+
+
+def _cell_text(raw: str) -> str:
+    """One HTML cell as plain text, with block tags becoming spaces."""
+    import html as _html
+
+    text = re.sub(r"<br\s*/?>|</?p\b[^>]*>|</li>", " ", raw, flags=re.I)
+    return " ".join(_html.unescape(_HTML_TAG.sub("", text)).split())
+
+
+def html_table_to_rows(block: str) -> list[list[str]]:
+    """Flatten one ``<table>`` into rectangular rows.
+
+    A cell spanning N columns is repeated N times, which is how a reader of the pipe
+    table would see it and keeps every row the same width. Row spans are not tracked
+    across rows -- that needs a grid model, and the geometric backends already collapse
+    the same structures, so this stays consistent with the rest of the corpus.
+    """
+    rows: list[list[str]] = []
+    for row_html in _HTML_ROW.findall(block):
+        cells: list[str] = []
+        for attrs, raw in _HTML_CELL.findall(row_html):
+            text = _cell_text(raw)
+            span = 1
+            match = _SPAN.search(attrs or "")
+            if match and "colspan" in (attrs or "").lower():
+                span = max(1, min(int(match.group(1)), 16))
+            cells.extend([text] * span)
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def html_tables_to_pipe(markdown: str) -> str:
+    """Replace every ``<table>`` in a transcription with a GitHub pipe table.
+
+    LightOnOCR-2 emits tables as HTML on purpose -- nested tables cannot survive markdown
+    -- but the rest of this corpus is pipe tables, and `lift_tables` only recognises
+    those. Converting here means one backend's output is not shaped differently from
+    every other paper's. A table that flattens to nothing is left as it was.
+    """
+    def replace(match: re.Match[str]) -> str:
+        rows = html_table_to_rows(match.group(0))
+        rows = [[clean_cell(c) for c in row] for row in rows]
+        rows = [r for r in rows if any(r)]
+        if len(rows) < 2:
+            return match.group(0)
+        return "\n\n" + render_rows(rows) + "\n\n"
+
+    return _HTML_TABLE.sub(replace, markdown)
+
+
 @dataclass
 class TableBlock:
     index: int                  # 1-based, in document order
@@ -705,6 +763,113 @@ class OpenDataLoaderConverter(BaseConverter):
         return self.finish(ConversionResult(body_markdown=body, tables=tables, n_chars=len(body)))
 
 
+class LightOnOCRConverter(BaseConverter):
+    """`lightonai/LightOnOCR-2-1B` -- an end-to-end OCR vision model.
+
+    The reason to reach for it is the one gap the geometric backends cannot close:
+    equations. Every other converter here recovers the PDF's *text layer*, so a formula
+    arrives as its visual approximation and `mark_equations` can only fence it. This
+    model was distilled on transcriptions that carry real LaTeX spans, with arXiv well
+    represented, so the maths comes back as maths. It also reads scans, which is what
+    the `low_text` flag exists to mark.
+
+    The cost is severe. It renders every page to an image and generates tokens for it:
+    LightOn measure 5.71 pages/s on an H100, and a mid-range card is a fraction of that
+    against ~0.12 s/page for docling. This is a backend for one paper, or for the scanned
+    and equation-heavy minority -- not for a 2.8M-paper crawl.
+
+    Tables come back as HTML by design ("some nested tables cannot be represented in
+    markdown"), so they are converted to pipe tables here to match the rest of the corpus.
+    """
+
+    name = "lightonocr"
+    model_id = "lightonai/LightOnOCR-2-1B"
+    # LightOn's stated preprocessing: 200 DPI, longest side 1540px, aspect preserved.
+    render_dpi = 200
+    longest_side = 1540
+
+    def __init__(self, cfg: Any):
+        super().__init__(cfg)
+        import pypdfium2
+        import torch
+        from transformers import AutoModelForVision2Seq, AutoProcessor
+
+        self._pdfium = pypdfium2
+        self._torch = torch
+
+        model_id = getattr(cfg, "lightonocr_model", None) or self.model_id
+        device = getattr(cfg, "device", "auto") or "auto"
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._device = device
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+        self._processor = AutoProcessor.from_pretrained(model_id)
+        self._model = AutoModelForVision2Seq.from_pretrained(
+            model_id, dtype=dtype, device_map=device if device == "cuda" else None,
+        )
+        if device != "cuda":
+            self._model.to(device)
+        self._model.eval()
+        self._max_new_tokens = int(getattr(cfg, "lightonocr_max_tokens", 4096))
+
+    def _render(self, pdf_path: Path, max_pages: int) -> list[Any]:
+        """PDF pages as PIL images at the resolution the model was trained on."""
+        doc = self._pdfium.PdfDocument(str(pdf_path))
+        try:
+            n_pages = len(doc)
+            images = []
+            for index in range(min(n_pages, max_pages)):
+                page = doc[index]
+                # pypdfium's scale is relative to 72 dpi.
+                bitmap = page.render(scale=self.render_dpi / 72)
+                image = bitmap.to_pil()
+                longest = max(image.size)
+                if longest > self.longest_side:
+                    ratio = self.longest_side / longest
+                    image = image.resize(
+                        (max(1, int(image.width * ratio)), max(1, int(image.height * ratio)))
+                    )
+                images.append(image)
+            return images, n_pages
+        finally:
+            doc.close()
+
+    def _transcribe(self, image: Any) -> str:
+        messages = [{"role": "user", "content": [{"type": "image"}]}]
+        prompt = self._processor.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = self._processor(text=prompt, images=image, return_tensors="pt")
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        with self._torch.inference_mode():
+            generated = self._model.generate(
+                **inputs, max_new_tokens=self._max_new_tokens, do_sample=False,
+            )
+        # Drop the prompt tokens; only the continuation is the transcription.
+        start = inputs["input_ids"].shape[-1]
+        return self._processor.decode(generated[0][start:], skip_special_tokens=True)
+
+    def convert(self, pdf_path: Path) -> ConversionResult:
+        images, n_pages = self._render(pdf_path, self.cfg.max_pages)
+        body_parts: list[str] = []
+        tables: list[TableBlock] = []
+
+        for page_no, image in enumerate(images, start=1):
+            markdown = html_tables_to_pipe(self._transcribe(image))
+            text, found = lift_tables(
+                markdown, page_no, len(tables) + 1,
+                detect_pseudocode=self.detect_pseudocode,
+                max_columns=self.max_table_columns,
+            )
+            tables.extend(found)
+            body_parts.append(text)
+
+        body = "\n\n".join(p.strip() for p in body_parts if p.strip())
+        return self.finish(ConversionResult(
+            body_markdown=body, tables=tables, n_pages=n_pages, n_chars=len(body),
+            truncated=n_pages > self.cfg.max_pages,
+        ))
+
+
 class MarkItDownConverter(BaseConverter):
     """Microsoft's markitdown. Fast and dependency-light, but its PDF path is a plain
     pdfminer text dump: no table structure at all. Useful mainly as a baseline in the
@@ -732,6 +897,7 @@ REGISTRY: dict[str, type[BaseConverter]] = {
     PdfPlumberConverter.name: PdfPlumberConverter,
     DoclingConverter.name: DoclingConverter,
     OpenDataLoaderConverter.name: OpenDataLoaderConverter,
+    LightOnOCRConverter.name: LightOnOCRConverter,
     MarkItDownConverter.name: MarkItDownConverter,
 }
 
@@ -753,6 +919,28 @@ def get_converter(name: str, cfg: Any) -> BaseConverter:
 # pickled back across the process boundary.
 
 _WORKER_CACHE: dict[str, BaseConverter] = {}
+_STORE_CACHE: dict[str, Any] = {}
+
+
+def _worker_uploader(minio_cfg: Any, arxiv_id: str) -> Any:
+    """An `upload(kind, path)` callback for one paper, or None when storage is local.
+
+    One MinIO client per worker process, built on first use and reused -- the same shape
+    as the converter cache, and for the same reason: a connection per paper would be
+    absurd, and a connection created in the parent could not cross into a spawned worker.
+    """
+    if not minio_cfg:
+        return None
+    from .objectstore import MinioSettings, MinioStore, upload_and_unlink
+
+    store = _STORE_CACHE.get("minio")
+    if store is None:
+        store = _STORE_CACHE["minio"] = MinioStore(MinioSettings(**minio_cfg))
+
+    def upload(kind: str, path: Path) -> None:
+        upload_and_unlink(store, path, store.name_for(kind, arxiv_id))
+
+    return upload
 
 
 def _worker_converter(name: str, cfg: Any) -> BaseConverter:
@@ -885,6 +1073,7 @@ def convert_and_write(
     pdf_bytes: int | None = None,
     pdf_sha256: str | None = None,
     keep_pdf: bool = False,
+    minio: dict[str, Any] | None = None,
 ) -> Any:
     """Convert one staged PDF, write the outputs, drop the PDF. Returns a `TaskResult`.
 
@@ -919,6 +1108,7 @@ def convert_and_write(
                     # matter, so "which papers took the fallback" stays answerable.
                     converter=name,
                     base_url=base_url,
+                    upload=_worker_uploader(minio, row.arxiv_id),
                 )
                 if errors:
                     log_.warning("%s converted by fallback %s after: %s",

@@ -169,16 +169,27 @@ def write_outputs(
     *,
     converter: str,
     base_url: str = "https://arxiv.org",
+    upload: Any = None,
 ) -> tuple[int, int]:
-    """Write the body, tables and metadata files. Returns ``(md_bytes, tables_bytes)``."""
+    """Write the body, tables and metadata files. Returns ``(md_bytes, tables_bytes)``.
+
+    `upload`, when given, is called as ``upload(kind, path)`` once each file is safely on
+    disk. It is what sends the paper to object storage, and it runs *after* the atomic
+    write rather than instead of it: the local file is the thing that survives a failed
+    upload, so it stays until the upload has returned. Deleting it is the uploader's job.
+    """
     md_written = atomic_write_text(
         md_path(data_dir, row.arxiv_id), render_body(row, result, converter)
     )
+    if upload:
+        upload("md", md_path(data_dir, row.arxiv_id))
 
     tables_written = 0
     tpath = tables_path(data_dir, row.arxiv_id)
     if result.tables:
         tables_written = atomic_write_text(tpath, render_tables(row, result))
+        if upload:
+            upload("tables", tpath)
     else:
         # A re-conversion that now finds no tables must not leave a stale file behind.
         tpath.unlink(missing_ok=True)
@@ -188,4 +199,6 @@ def write_outputs(
         json.dumps(build_metadata(row, result, base_url=base_url),
                    ensure_ascii=False, indent=2) + "\n",
     )
+    if upload:
+        upload("meta", meta_path(data_dir, row.arxiv_id))
     return md_written, tables_written

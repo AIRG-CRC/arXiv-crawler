@@ -238,6 +238,15 @@ transient failure heals by itself — see [Retries](#retries). `--worker-bars` a
 line per conversion worker under the main bar.
 
 ```bash
+python -m src.main run-minio [same flags as run]
+python -m src.main dump [--keep-local] [--skip-existing] [--limit N] [--dry-run]
+python -m src.main test-paper <id> [--converter NAME] [--minio] [--show N]
+```
+Object storage. `run-minio` is `run` with the output sent to MinIO instead of kept on
+disk; `dump` migrates a corpus that is already local; `test-paper` puts one paper through
+the whole path without touching the manifest. See [Object storage](#object-storage).
+
+```bash
 python -m src.main status     # counts by status, output size, tables extracted
 python -m src.main verify     # cross-check the manifest against files on disk; --fix re-queues
 python -m src.main retry --stage {download,convert,all} [--max-attempts N]
@@ -326,6 +335,41 @@ file and silenced entirely in conversion workers.
 
 ---
 
+## Object storage
+
+Converted papers can live in a MinIO bucket instead of on local disk. The bucket mirrors
+the local layout, so an object name follows from an arXiv id with no lookup:
+
+```
+arxiv/md/2301/2301.12345.md
+arxiv/tables/2301/2301.12345.tables.md
+arxiv/meta/2301/2301.12345.json
+```
+
+**Credentials come from the environment.** `config.yaml` is tracked in git and is the
+wrong place for a secret key; setting them there still works but logs a warning.
+
+```bash
+export MINIO_ACCESS_KEY=...  MINIO_SECRET_KEY=...
+```
+
+```bash
+python -m src.main dump --dry-run     # what would be sent, connecting to nothing
+python -m src.main dump               # upload everything local, then remove it
+python -m src.main run-minio          # crawl straight into the bucket
+```
+
+**Writing is local-then-upload-then-delete**, not straight to the network. The atomic
+local write is what makes an interrupted run safe, and it stays until the upload has
+returned — so a dropped connection leaves the paper on disk, where the next `dump` finds
+it. Only a confirmed upload removes it, which also makes `dump` resumable: whatever is
+still on disk is precisely what still needs sending.
+
+`--keep-local` turns `dump` into a copy rather than a move. `--skip-existing` avoids
+re-sending objects already in the bucket, at one HEAD request per file.
+
+---
+
 ## Converter backends
 
 The converter is a pluggable interface; each backend imports its dependency lazily, so a missing
@@ -336,7 +380,36 @@ package or absent JVM only matters if you actually select it.
 | `pymupdf` *(default)* | ~10–30 pages/s | AGPL-3.0 | — | `pymupdf4llm` for layout, `find_tables` for tables. |
 | `pdfplumber` | ~1–3 pages/s | MIT | — | The licence escape hatch. Same table algorithm, far slower. |
 | `docling` | ~0.2–1 pages/s | MIT | `docling` | Best table fidelity (TableFormer). Realistically an opt-in re-run, not a corpus-scale default. |
+| `lightonocr` | ~1–2 pages/s* | Apache-2.0 | `transformers`, GPU, ~2 GB weights | **The only backend that recovers real LaTeX.** See below. |
 | `opendataloader` | moderate | Apache-2.0 | **JDK 11+** | Strong structure, but shells out to a JVM. |
+
+\* LightOn measure 5.71 pages/s on an H100; a mid-range card is a fraction of that.
+
+### LightOnOCR: the one backend that reads equations
+
+Every other converter recovers the PDF's *text layer*, so a formula arrives as its visual
+approximation and `mark_equations` can only put `$$` around it.
+[`lightonai/LightOnOCR-2-1B`](https://huggingface.co/lightonai/LightOnOCR-2-1B) is an
+end-to-end vision model distilled on transcriptions that carry real **LaTeX spans**, with
+arXiv well represented in its training corpus. It also reads scans, which is what the
+`low_text` flag exists to mark.
+
+```bash
+python -m src.main test-paper 1706.03762 --converter lightonocr --show
+```
+
+Two things to know before reaching for it:
+
+- **It is not a corpus-scale backend.** It renders every page to an image at 200 DPI and
+  generates tokens for it. Against docling's ~0.12 s/page, a 2.8M-paper crawl is out of
+  reach on one GPU. Use it for a single paper, for the `low_text` scans, or for
+  equation-heavy work.
+- **Its tables arrive as HTML**, deliberately — "some nested tables cannot be represented
+  in markdown". They are converted to pipe tables on the way in, so its papers are shaped
+  like every other paper in `data/tables`. Nested tables flatten, exactly as the geometric
+  backends already flatten them.
+
+---
 
 ### Why PyMuPDF, and why no AI agent for tables
 

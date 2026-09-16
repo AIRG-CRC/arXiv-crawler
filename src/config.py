@@ -156,6 +156,22 @@ class Retry:
 
 
 @dataclass
+class Minio:
+    """Where converted papers go when object storage is the target.
+
+    `access_key` and `secret_key` are deliberately left null: this file is tracked in
+    git, so credentials belong in MINIO_ACCESS_KEY / MINIO_SECRET_KEY instead. They are
+    accepted here only so a throwaway local instance is not a nuisance to point at.
+    """
+    endpoint: str = "10.3.18.40:9000"
+    bucket: str = "airg"
+    prefix: str = "arxiv"          # everything lands under this key prefix
+    secure: bool = False           # the endpoint above is plain HTTP
+    access_key: str | None = None
+    secret_key: str | None = None
+
+
+@dataclass
 class Postgres:
     """Defines the postgres ingestion status"""
     dsn: str | None = None
@@ -169,11 +185,12 @@ class Config:
     crawl: Crawl = field(default_factory=Crawl)
     convert: Convert = field(default_factory=Convert)
     retry: Retry = field(default_factory=Retry)
+    minio: Minio = field(default_factory=Minio)
     postgres: Postgres = field(default_factory=Postgres)
 
     SECTIONS: ClassVar[dict[str, type]] = {
         "paths": Paths, "scope": Scope, "crawl": Crawl,
-        "convert": Convert, "retry": Retry, "postgres": Postgres,
+        "convert": Convert, "retry": Retry, "minio": Minio, "postgres": Postgres,
     }
 
     @classmethod

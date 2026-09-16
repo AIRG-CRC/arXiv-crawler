@@ -17,6 +17,7 @@ from pathlib import Path
 from .config import Config
 from .utils import paths as P
 from .utils.checkpoint import CheckpointStore
+from .utils.converter import REGISTRY
 from .utils.crawler import run_pipeline
 from .utils.logging_setup import configure_logging
 from .utils.prepare_data import prepare
@@ -24,9 +25,13 @@ from .utils.state import DONE, FAILED_CONVERT, FAILED_DOWNLOAD, NO_PDF, PENDING,
 
 log = logging.getLogger("arxiv_crawler")
 
-# `run` is a progress bar, not a transcript: it logs to the file and keeps stderr clear.
-# The other commands are one-shot reports, so their handful of lines belong on stderr.
-QUIET_COMMANDS = {"run"}
+# Commands that own the terminal with a progress bar: they log to the file and keep
+# stderr clear. The rest are one-shot reports, so their few lines belong on stderr.
+QUIET_COMMANDS = {"run", "run-minio", "dump", "test-paper"}
+
+# Sourced from the registry rather than a hand-written list, so a new backend is
+# selectable the moment it is registered.
+CONVERTERS = sorted(REGISTRY)
 
 
 def _csv(value: str) -> list[str]:
@@ -82,7 +87,7 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         print(message, file=sys.stderr)
     tallies = run_pipeline(
         cfg, limit=args.limit, keep_pdf=args.keep_pdf, worker_bars=args.worker_bars,
-        retry_all=args.retry_all,
+        retry_all=args.retry_all, to_minio=getattr(args, "to_minio", False),
     )
     summary = (
         "processed {processed:,}: {done:,} converted, {no_pdf:,} without a PDF, "
@@ -96,6 +101,75 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         if tallies.get("failed"):
             print(f"full detail in {cfg.paths.logs_dir / 'crawler.log'}")
     return 0
+
+
+def cmd_run_minio(cfg: Config, args: argparse.Namespace) -> int:
+    """`run`, but the converted paper goes to the bucket and the local copy is removed."""
+    args.to_minio = True
+    return cmd_run(cfg, args)
+
+
+def cmd_dump(cfg: Config, args: argparse.Namespace) -> int:
+    """Upload the corpus already on disk, then drop the local copies."""
+    from tqdm import tqdm
+
+    from .utils.migrate import count_artefacts, dump_to_bucket, prune_empty_dirs
+    from .utils.objectstore import MinioSettings, MinioStore, ObjectStoreError
+
+    data_dir = cfg.paths.data_dir
+    try:
+        settings = MinioSettings.from_config(cfg.minio)
+        store = MinioStore(settings)
+        if not args.dry_run:
+            # A dry run never opens a connection, so it should not demand credentials --
+            # listing what *would* be sent is exactly what you want before setting them.
+            settings.validate()
+            store.ensure_bucket()
+    except ObjectStoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    total = count_artefacts(data_dir)
+    if not total:
+        print(f"nothing to dump — no files under {data_dir}/{{md,tables,meta}}")
+        return 0
+
+    target = min(total, args.limit) if args.limit else total
+    print(f"{'would upload' if args.dry_run else 'uploading'} {target:,} file(s) "
+          f"from {data_dir} to {store.describe()}")
+    if not args.keep_local and not args.dry_run:
+        print("local copies are removed once each upload succeeds")
+
+    bar = tqdm(total=target, unit="file", desc="dump", smoothing=0.05)
+    try:
+        report = dump_to_bucket(
+            store, data_dir,
+            keep_local=args.keep_local, skip_existing=args.skip_existing,
+            limit=args.limit, dry_run=args.dry_run, progress=bar,
+        )
+    finally:
+        bar.close()
+
+    print(f"\nuploaded {report.uploaded:,}  skipped {report.skipped:,}  "
+          f"failed {report.failed:,}  ({_human(report.bytes_sent)} sent)")
+    for message in report.errors[:10]:
+        print(f"  ✗ {message}")
+    if len(report.errors) > 10:
+        print(f"  ... and {len(report.errors) - 10:,} more; see the log")
+    if not args.keep_local and not args.dry_run:
+        pruned = prune_empty_dirs(data_dir)
+        if pruned:
+            print(f"removed {pruned:,} empty shard director{'y' if pruned == 1 else 'ies'}")
+    if report.failed:
+        print("re-run `dump` to retry the failures — the local copies are still there")
+    return 1 if report.failed else 0
+
+
+def cmd_test_paper(cfg: Config, args: argparse.Namespace) -> int:
+    """Delegates to `src.test_paper`, so the two entry points cannot drift apart."""
+    from .test_paper import run as run_test_paper
+
+    return run_test_paper(cfg, args)
 
 
 def cmd_status(cfg: Config, _args: argparse.Namespace) -> int:
@@ -205,25 +279,57 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, help="cap on papers inserted")
     sp.set_defaults(func=cmd_prepare)
 
-    sr = sub.add_parser("run", help="download and convert, in parallel")
-    sr.add_argument("--download-workers", type=int)
-    sr.add_argument("--convert-workers", type=int)
-    sr.add_argument("--rps", type=float, help="global request rate ceiling, shared by all workers")
-    sr.add_argument("--burst", type=int)
-    sr.add_argument("--converter",
-                    choices=["pymupdf", "pdfplumber", "docling", "opendataloader", "markitdown"])
-    sr.add_argument("--limit", type=int, help="stop after this many papers")
-    sr.add_argument("--keep-pdf", action="store_true", help="keep staged PDFs (debugging)")
-    sr.add_argument("--no-retry-failed", action="store_true",
-                    help="skip the retry pass and go straight to pending work")
-    sr.add_argument("--retry-all", action="store_true",
-                    help="retry every failed paper, ignoring the attempt ceiling")
-    sr.add_argument("--max-attempts", type=int,
-                    help="total tries a paper gets before the retry pass gives up "
-                         "(default: retry.max_attempts in config.yaml)")
-    sr.add_argument("--worker-bars", action="store_true",
-                    help="one progress line per conversion worker, under the main bar")
-    sr.set_defaults(func=cmd_run)
+    def add_run_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        """`run` and `run-minio` differ only in where the output goes, so they share
+        every flag rather than keeping two lists in step by hand."""
+        parser.add_argument("--download-workers", type=int)
+        parser.add_argument("--convert-workers", type=int)
+        parser.add_argument("--rps", type=float,
+                            help="global request rate ceiling, shared by all workers")
+        parser.add_argument("--burst", type=int)
+        parser.add_argument("--converter", choices=sorted(CONVERTERS))
+        parser.add_argument("--limit", type=int, help="stop after this many papers")
+        parser.add_argument("--keep-pdf", action="store_true",
+                            help="keep staged PDFs (debugging)")
+        parser.add_argument("--no-retry-failed", action="store_true",
+                            help="skip the retry pass and go straight to pending work")
+        parser.add_argument("--retry-all", action="store_true",
+                            help="retry every failed paper, ignoring the attempt ceiling")
+        parser.add_argument("--max-attempts", type=int,
+                            help="total tries a paper gets before the retry pass gives up "
+                                 "(default: retry.max_attempts in config.yaml)")
+        parser.add_argument("--worker-bars", action="store_true",
+                            help="one progress line per conversion worker, under the main bar")
+        return parser
+
+    sr = add_run_flags(sub.add_parser("run", help="download and convert, in parallel"))
+    sr.set_defaults(func=cmd_run, to_minio=False)
+
+    sm = add_run_flags(sub.add_parser(
+        "run-minio", help="like `run`, but store each paper in MinIO and drop the local copy"))
+    sm.set_defaults(func=cmd_run_minio, to_minio=True)
+
+    sd = sub.add_parser("dump", help="upload the corpus already on disk to MinIO")
+    sd.add_argument("--keep-local", action="store_true",
+                    help="copy instead of move: leave the local files in place")
+    sd.add_argument("--skip-existing", action="store_true",
+                    help="do not re-send objects already in the bucket (one HEAD per file)")
+    sd.add_argument("--limit", type=int, help="stop after this many files")
+    sd.add_argument("--dry-run", action="store_true",
+                    help="report what would be uploaded, touching nothing")
+    sd.set_defaults(func=cmd_dump)
+
+    stp = sub.add_parser("test-paper",
+                         help="download, convert and store one paper; ignores the manifest")
+    stp.add_argument("paper", help="arXiv id, versioned id, or an arxiv.org URL")
+    stp.add_argument("--converter", choices=sorted(CONVERTERS))
+    stp.add_argument("--minio", action="store_true",
+                     help="store the output in the bucket and drop the local copy")
+    stp.add_argument("--keep-pdf", action="store_true", help="keep the staged PDF")
+    stp.add_argument("--title", help="title for the front matter (metadata is not fetched)")
+    stp.add_argument("--show", type=int, nargs="?", const=2000, metavar="N",
+                     help="print the first N characters of the markdown")
+    stp.set_defaults(func=cmd_test_paper)
 
     ss = sub.add_parser("status", help="progress report")
     ss.set_defaults(func=cmd_status)

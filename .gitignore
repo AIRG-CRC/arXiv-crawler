@@ -21,3 +21,12 @@ __pycache__/
 .DS_Store
 /.claude/
 /.vscode/
+
+# secrets. "Several MinIO object operations.md" carries a live access/secret key pair,
+# and was one `git add .` away from being published. Credentials belong in the
+# environment (MINIO_ACCESS_KEY / MINIO_SECRET_KEY), never in a tracked file.
+Several MinIO object operations.md
+*.env
+.env
+.envrc
+credentials.json

@@ -55,7 +55,7 @@ convert:
   # ~1.2 GB above its ~2.4 GB working set, for one model reload (~5%) every few minutes.
   max_tasks_per_child: 100 # retire a worker after N papers; null to keep it for the run
   memory_floor: 0.12 # pause dispatch below this much free RAM; fraction, "4GB", or null
-  timeout: 600 # seconds per PDF, before the worker abandons it
+  timeout: 1500 # seconds per PDF, before the worker abandons it
   max_pages: 300
   table_strategy: lines_strict
   table_fallback_strategy: null
@@ -79,6 +79,19 @@ retry:
   # died. `max_attempts` still caps the lifetime total, so this cannot spin.
   in_run: true
   in_run_attempts: 1
+
+# Object storage for `run-minio`, `dump` and `test-paper --minio`. The bucket mirrors the
+# local layout: <prefix>/md/<shard>/<id>.md, and likewise for tables/ and meta/.
+#
+# Credentials are NOT set here — this file is tracked in git. Export them instead:
+#   export MINIO_ACCESS_KEY=...  MINIO_SECRET_KEY=...
+minio:
+  endpoint: 10.3.18.40:9000
+  bucket: airg
+  prefix: arxiv
+  secure: false # the endpoint above is plain HTTP
+  access_key: null
+  secret_key: null
 
 postgres:
   dsn: null # e.g. "postgresql://user:pass@localhost:5432/arxiv"

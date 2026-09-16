@@ -95,7 +95,16 @@ class CheckpointStore:
 
     # --- run lifecycle ---------------------------------------------------------------
     def begin(self, *, target: int, settings: dict[str, Any] | None = None) -> Totals:
-        """Start or resume a run. Returns what previous, unfinished workers achieved."""
+        """Start a run. Returns what the previous, unfinished one achieved.
+
+        The previous run's worker files are recorded and then cleared. Carrying them
+        forward made slots accumulate without bound: a slot is only reused if its pid
+        reappears, and pids never do -- least of all now that `max_tasks_per_child`
+        retires workers mid-run. Observed: 1,085 files in a directory that should hold
+        one per worker, all of them re-read at every start.
+
+        Progress across runs is the manifest's job, not this directory's.
+        """
         carried = self.load_workers()
         self.run_id = uuid.uuid4().hex[:12]
         # A completed run leaves only summary.json; its counters are history, not
@@ -108,8 +117,10 @@ class CheckpointStore:
             "resumed_from": asdict(self.totals(carried)),
             "settings": settings or {},
         })
-        self._workers = {w.slot: w for w in carried}
-        self._slot_of = {w.pid: w.slot for w in carried if w.pid}
+        for path in self.root.glob(WORKER_GLOB):
+            path.unlink(missing_ok=True)
+        self._workers = {}
+        self._slot_of = {}
         return self.totals(carried)
 
     def finalize(self, tallies: dict[str, int] | None = None) -> None:

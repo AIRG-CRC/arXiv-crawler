@@ -59,8 +59,16 @@ def test_checkpoint_files_are_valid_json_and_readable(store):
     assert data["slot"] == 0 and data["pid"] == 7
 
 
-def test_an_interrupted_run_is_resumed_not_restarted(tmp_path):
-    """The whole point: a resumed run continues the count instead of going back to 0."""
+def test_begin_reports_the_interrupted_run_then_starts_its_own_count(tmp_path):
+    """An interrupted run's tally is handed back once, as a fact about that run, and the
+    new run then counts only itself.
+
+    These counters used to be carried forward so the progress bar could resume mid-count.
+    That is now the manifest's job, because it is the only thing that survives a clean
+    finish: `finalize` deletes the worker files, so anything measured here misses every
+    run that completed. On a real manifest the two had drifted to 108,492 against
+    221,056 papers actually converted.
+    """
     root = tmp_path / "checkpoints"
     first = CheckpointStore(root)
     first.begin(target=100)
@@ -70,11 +78,25 @@ def test_an_interrupted_run_is_resumed_not_restarted(tmp_path):
 
     resumed = CheckpointStore(root)
     carried = resumed.begin(target=88)
-    assert carried.processed == 12
+    assert carried.processed == 12       # still reported, for run.json and the log
     assert carried.workers == 3
 
     resumed.bump(pid=100, status="done", arxiv_id="2301.00099")
-    assert resumed.totals().processed == 13      # continues, does not restart
+    assert resumed.totals().processed == 1      # this run's own work, not 13
+
+
+def test_worker_files_do_not_accumulate_across_runs(tmp_path):
+    """Slots were only reused when a pid reappeared, and pids never do -- so every run
+    added a fresh set. A real directory reached 1,085 files for a 4-worker run, all of
+    them re-read at every start."""
+    root = tmp_path / "checkpoints"
+    for run in range(5):
+        store = CheckpointStore(root)
+        store.begin(target=10)
+        for pid in range(run * 100, run * 100 + 3):   # a new set of pids every run
+            store.bump(pid=pid, status="done", arxiv_id="x")
+
+    assert len(list(root.glob("worker-*.json"))) == 3
 
 
 def test_finalize_collapses_to_one_summary_and_clears_the_debris(store):

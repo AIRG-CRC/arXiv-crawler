@@ -24,6 +24,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -247,6 +248,7 @@ def run_pipeline(
     keep_pdf: bool = False,
     worker_bars: bool = False,
     retry_all: bool = False,
+    to_minio: bool = False,
 ) -> dict[str, int]:
     """Drive download -> convert -> manifest until the queue drains or Ctrl-C arrives.
 
@@ -257,6 +259,20 @@ def run_pipeline(
     """
     cfg.paths.ensure()
     data_dir = cfg.paths.data_dir
+
+    # Resolved here, in the parent, so a misconfiguration fails before a single paper is
+    # downloaded rather than once per worker. Passed to workers as a plain dict because
+    # spawn has to pickle it, and a live client cannot cross a process boundary.
+    minio_settings: dict[str, Any] | None = None
+    if to_minio:
+        from .objectstore import MinioSettings, MinioStore
+
+        settings = MinioSettings.from_config(cfg.minio)
+        settings.validate()
+        probe = MinioStore(settings)
+        probe.ensure_bucket()                  # also proves the endpoint is reachable
+        console("storing to %s", probe.describe())
+        minio_settings = asdict(settings)
 
     manifest = Manifest(cfg.paths.manifest_db)
     reclaimed = manifest.reset_stale()
@@ -328,28 +344,40 @@ def run_pipeline(
     writer = ManifestWriter(cfg.paths.manifest_db)
     writer.start()
 
-    # Checkpoints: one file per worker, incremented once per completed paper. A resumed
-    # run continues the progress bar from where the interrupted one stopped instead of
-    # restarting at zero.
+    # Checkpoints record per-worker detail for the `checkpoint` command. They are NOT the
+    # bar's source of numbers: their counters only cover runs that were interrupted --
+    # `finalize` deletes the files on a clean finish -- so they drift from reality without
+    # bound. Measured on this manifest: the bar opened at 108,492 against 221,056 papers
+    # actually converted, under-reporting by more than half the corpus.
     checkpoints = CheckpointStore(cfg.paths.checkpoints_dir)
-    carried = checkpoints.begin(target=todo, settings={
+    checkpoints.begin(target=todo, settings={
         "download_workers": cfg.crawl.workers,
         "convert_workers": cfg.convert.workers,
         "converter": cfg.convert.converter,
         "rate_per_sec": cfg.crawl.rate_per_sec,
     })
-    if carried.processed:
-        log.info("resuming: %s paper(s) already processed by %d worker(s) in the "
-                 "interrupted run", f"{carried.processed:,}", carried.workers)
+    # Everything the bar reports comes from the manifest, so it can never disagree with
+    # `status`. The bar measures the corpus: converted papers out of papers in scope.
+    total_papers = stats.get("total", 0)
+    done_at_start = stats.get(DONE, 0)
+    pending_at_start = stats.get(PENDING, 0)
+    claimed_from_pending = 0        # drives the Pending= readout as rows are claimed
 
     tallies = dict(EMPTY_TALLIES)
     max_inflight = max(4 * cfg.convert.workers, 2 * cfg.crawl.workers)
     bar = tqdm(
-        total=todo + carried.processed, initial=carried.processed,
+        total=total_papers, initial=done_at_start,
         unit="paper", desc="crawl+convert", smoothing=0.05, position=0,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
     )
-    bar.set_postfix(ok=carried.done, fail=carried.failed, refresh=False)
+
+    def _refresh_postfix() -> None:
+        bar.set_postfix_str(
+            f"Fail={tallies['failed']:,}, Done={tallies['done']:,}, "
+            f"Workers={_live_workers()}/{cfg.convert.workers}, "
+            f"Pending={pending_at_start - claimed_from_pending:,}",
+            refresh=False,
+        )
     bars = WorkerBars(cfg.convert.workers, enabled=worker_bars)
 
     # Papers that failed and still have tries left, waiting to go round again. They stay
@@ -425,15 +453,15 @@ def run_pipeline(
         checkpoints.bump(result.worker_id or os.getpid(), result.status, result.arxiv_id)
         if result.worker_id:
             bars.bump(result.worker_id, result.arxiv_id)
-        totals = checkpoints.totals()
-        # `w` is live workers over the number configured. Two earlier versions of this
-        # were both wrong: checkpoints.totals().workers counts accumulated worker-NN.json
-        # files, which carry over between runs ("w=17" on a two-worker run), and counting
-        # distinct pids seen this run overshoots as soon as `max_tasks_per_child` starts
-        # recycling them ("w=8/4"). The pool's own process table is the live answer.
-        bar.set_postfix(ok=totals.done, fail=totals.failed,
-                        w=f"{_live_workers()}/{cfg.convert.workers}", refresh=False)
-        bar.update(1)
+        # The bar counts *converted* papers, so only a success advances it. A failed or
+        # withdrawn paper still has no markdown on disk, and moving the bar for it would
+        # claim otherwise. `update(0)` keeps tqdm's clock and rate current regardless.
+        #
+        # Fail/Done describe *this run*; they used to come from checkpoints.totals(),
+        # which sums leftover files from previous interrupted runs -- so the bar could
+        # report `fail=10` with no failures in the manifest and no `✗` ever printed.
+        _refresh_postfix()
+        bar.update(1 if result.status == DONE else 0)
 
     def _download(row: PaperRow) -> tuple[PaperRow, DownloadOutcome]:
         return row, download_one(row, session, limiter, data_dir, stop)
@@ -445,7 +473,7 @@ def run_pipeline(
         the manifest. Ids from the cross-run worklist are consumed off the snapshot as
         they are handed out, so that pass walks the list exactly once.
         """
-        nonlocal fresh_dispatched
+        nonlocal fresh_dispatched, claimed_from_pending
         rows: list[PaperRow] = []
         while requeue and len(rows) < want:
             rows.append(requeue.popleft())
@@ -465,6 +493,8 @@ def run_pipeline(
             batch = manifest.claim_batch(want)
             rows += batch
             fresh_dispatched += len(batch)
+            # Only these leave the `pending` pool; retries come from the failed statuses.
+            claimed_from_pending += len(batch)
         return rows
 
     # Back-pressure, so that running out of memory slows the crawl down instead of
@@ -574,7 +604,7 @@ def run_pipeline(
                         row, outcome.path, data_dir, cfg.convert,
                         base_url=cfg.crawl.base_url,
                         pdf_bytes=outcome.size, pdf_sha256=outcome.sha256,
-                        keep_pdf=keep_pdf,
+                        keep_pdf=keep_pdf, minio=minio_settings,
                     )
                     conversions[submitted] = row
                     started_at[submitted] = time.monotonic()
