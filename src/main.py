@@ -80,7 +80,7 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         # `override` skips None values, so the "no ceiling" case is set directly.
         cfg.retry.max_attempts = None
     try:
-        partition = resolve_partition(args.devices, args.device_index)
+        partition = resolve_partition(args.devices, args.device_index, cfg.sync)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -195,7 +195,7 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
     from .utils.sync import run_sync
 
     try:
-        partition = resolve_partition(args.devices, args.device_index)
+        partition = resolve_partition(args.devices, args.device_index, cfg.sync)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

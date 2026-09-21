@@ -100,6 +100,76 @@ def test_a_non_numeric_environment_value_is_rejected(monkeypatch):
         resolve_partition(None, None)
 
 
+def test_config_supplies_the_partition(monkeypatch):
+    """`sync.devices` / `sync.device_index` in config.yaml, the fixed per-machine option."""
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+
+    class Cfg:
+        devices = 2
+        device_index = 1
+
+    assert resolve_partition(cfg=Cfg()) == (2, 1)
+
+
+def test_precedence_is_flag_then_environment_then_config(monkeypatch):
+    class Cfg:
+        devices = 2
+        device_index = 1
+
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+    assert resolve_partition(cfg=Cfg()) == (2, 1)            # config alone
+
+    monkeypatch.setenv(DEVICES_ENV, "4")
+    monkeypatch.setenv(INDEX_ENV, "3")
+    assert resolve_partition(cfg=Cfg()) == (4, 3)            # environment wins over config
+
+    assert resolve_partition(8, 7, cfg=Cfg()) == (8, 7)      # a flag wins over both
+
+
+def test_a_single_device_in_the_config_is_the_whole_corpus(monkeypatch):
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+
+    class Cfg:
+        devices = 1
+        device_index = 0
+
+    assert resolve_partition(cfg=Cfg()) is None
+
+
+def test_a_contradictory_config_is_rejected(monkeypatch):
+    """An index the device count cannot accommodate is a misconfiguration, not a default."""
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+
+    class Cfg:
+        devices = 2
+        device_index = 5
+
+    with pytest.raises(ValueError):
+        resolve_partition(cfg=Cfg())
+
+
+def test_a_non_numeric_config_value_names_the_key(monkeypatch):
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+
+    class Cfg:
+        devices = "two"
+        device_index = 0
+
+    with pytest.raises(ValueError, match="sync.devices"):
+        resolve_partition(cfg=Cfg())
+
+
+def test_a_config_object_without_the_fields_is_harmless(monkeypatch):
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+    assert resolve_partition(cfg=object()) is None
+
+
 def test_describe():
     assert describe(None) == "the whole corpus"
     assert describe((2, 0)) == "slice 1 of 2"

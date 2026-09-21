@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import zlib
+from typing import Any
 
 BUCKETS = 256
 
@@ -42,34 +43,54 @@ def bucket_for(arxiv_id: str) -> int:
     return zlib.crc32(arxiv_id.encode("utf-8")) % BUCKETS
 
 
-def _from_env(name: str) -> int | None:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
+def _as_int(value: Any, source: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
         return None
     try:
-        return int(raw)
-    except ValueError:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{source} must be an integer, got {value!r}") from None
+
+
+def _from_env(name: str) -> int | None:
+    return _as_int(os.environ.get(name), name)
 
 
 def resolve_partition(
-    devices: int | None = None, index: int | None = None
+    devices: int | None = None,
+    index: int | None = None,
+    cfg: Any = None,
 ) -> tuple[int, int] | None:
     """`(devices, index)` for this device, or None for "the whole corpus".
 
-    Explicit arguments win over the environment, so a one-off run can override a shell
-    profile. `None` is returned for a single device so the claim SQL stays byte-for-byte
-    what it was before partitioning existed.
+    Three sources, in descending precedence: the CLI flag, the environment, and
+    `sync.devices` / `sync.device_index` in `config.yaml`. A flag therefore overrides a
+    shell profile, which overrides the file -- so a one-off run can always differ from the
+    machine's usual identity without editing anything.
+
+    `None` is returned for a single device, so the claim SQL stays byte-for-byte what it was
+    before partitioning existed.
+
+    Note that `config.yaml` is tracked in git. Putting a per-device index there works, but a
+    pull or a checkout can carry one machine's index onto another, at which point both crawl
+    the same slice and nothing crawls the rest. The startup marker cross-check
+    (`sync.check_partition_agreement`) is what catches that.
     """
     if devices is None:
         devices = _from_env(DEVICES_ENV)
+    if devices is None:
+        devices = _as_int(getattr(cfg, "devices", None), "sync.devices")
     if index is None:
         index = _from_env(INDEX_ENV)
+    if index is None:
+        index = _as_int(getattr(cfg, "device_index", None), "sync.device_index")
     if devices is None and index is None:
         return None
 
-    devices = 1 if devices is None else int(devices)
-    index = 0 if index is None else int(index)
+    devices = 1 if devices is None else devices
+    index = 0 if index is None else index
     if devices < 1:
         raise ValueError(f"device count must be at least 1, got {devices}")
     if devices > BUCKETS:

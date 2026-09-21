@@ -199,11 +199,22 @@ class Minio:
 class Sync:
     """Reconciling the local manifest against the shared bucket before a run.
 
-    `device` is deliberately null here: this file is tracked in git, so a per-device value
-    conflicts on every pull. Set ARXIV_CRAWLER_DEVICE in the environment instead -- the
-    same convention the MinIO credentials use.
+    The three per-device settings -- `device`, `devices`, `device_index` -- can be set here
+    or in the environment (ARXIV_CRAWLER_DEVICE / _DEVICES / _DEVICE_INDEX), with the
+    environment winning, and a `--devices` / `--device-index` flag winning over both.
+
+    Setting them here is the fixed, per-machine option, at one cost worth knowing: this file
+    is tracked in git, so a pull, a merge or a checkout can carry one machine's
+    `device_index` onto another. Two devices on the same index crawl the same slice and
+    nothing crawls the rest. The startup cross-check against each device's bucket marker is
+    what catches that, and it warns rather than refuses -- so read the first few lines of a
+    run after you change these.
     """
     device: str | None = None
+    # How many machines share this corpus, and which slice this one takes (0-based).
+    # null/1 means "this machine does all of it", which is the single-device default.
+    devices: int | None = None
+    device_index: int | None = None
     # Require a meta object as well as an md object before believing a paper is finished.
     # The upload order is md -> tables -> meta, so a device killed between the first and
     # the last leaves an md with no meta, and nobody would ever produce it.

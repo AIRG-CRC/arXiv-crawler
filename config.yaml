@@ -108,11 +108,22 @@ minio:
   secret_key: null
 
 # Reconciling with the bucket before a run, so two devices never convert the same paper.
-# `device` stays null here -- this file is tracked in git. Export instead:
+#
+# The three per-device settings below can also come from the environment, which takes
+# precedence over this file, and from --devices / --device-index, which take precedence over
+# both:
 #   export ARXIV_CRAWLER_DEVICE=mac-studio
 #   export ARXIV_CRAWLER_DEVICES=2  ARXIV_CRAWLER_DEVICE_INDEX=0
+#
+# !! This file is tracked in git. If you set `device_index` here, a pull, merge or checkout
+# !! can carry one machine's value onto the other -- and two devices on the same index crawl
+# !! the same slice while nothing crawls the rest. Every run cross-checks the other devices'
+# !! bucket markers and prints a ⚠ line when it sees that, but it warns rather than refuses.
+# !! After changing these, read the first few lines of the run.
 sync:
-  device: null
+  device: null # this machine's name in the bucket; null falls back to the hostname
+  devices: null # how many machines share this corpus; null or 1 means just this one
+  device_index: null # which slice this machine takes, 0-based, up to devices - 1
   require_meta: true # a paper counts as done only if md AND meta are in the bucket
   on_start: true # sync automatically at the start of `run-minio`
   marker: true # publish <prefix>/_state/sync/<device>.json after each sync

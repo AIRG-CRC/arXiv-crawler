@@ -373,22 +373,36 @@ All defaults live in [`config.yaml`](config.yaml); CLI flags override them per f
 | `minio.endpoint` | `10.3.18.40:9000` | Host and port. Credentials come from the environment. |
 | `minio.bucket` / `minio.prefix` | `airg` / `arxiv` | Everything lands under `<bucket>/<prefix>/`. |
 | `minio.secure` | `false` | `true` for HTTPS endpoints. |
-| `sync.device` | `null` | This device's name in the bucket. **Set `ARXIV_CRAWLER_DEVICE` instead.** |
+| `sync.device` | `null` | This device's name in the bucket; `null` uses the hostname. |
+| `sync.devices` | `null` | How many machines share this corpus. `null` or `1` means just this one. |
+| `sync.device_index` | `null` | Which slice this machine takes, 0-based. See the warning below. |
 | `sync.require_meta` | `true` | A paper counts as done only if *both* its `md` and `meta` objects exist. |
 | `sync.on_start` | `true` | Reconcile with the bucket at the start of every `run-minio`. |
 | `sync.marker` | `true` | Publish `<prefix>/_state/sync/<device>.json` after each sync. |
 
 Raising `crawl.workers` increases concurrency, **never** the request rate past `rate_per_sec`.
 
-**Three settings belong in the environment, not in this file**, because `config.yaml` is tracked
-in git and a per-device value there conflicts on every pull:
+**Credentials never go in this file** — it is tracked in git. Export them:
 
 ```bash
 export MINIO_ACCESS_KEY=...  MINIO_SECRET_KEY=...
+```
+
+The three per-device settings can go either in `config.yaml` or in the environment, which takes
+precedence over the file; `--devices` / `--device-index` take precedence over both, so a one-off
+run can always differ from the machine's usual identity.
+
+```bash
 export ARXIV_CRAWLER_DEVICE=mac-studio          # this machine's name in the bucket
 export ARXIV_CRAWLER_DEVICES=2                  # how many devices share the corpus
 export ARXIV_CRAWLER_DEVICE_INDEX=0             # which slice this one takes
 ```
+
+> **If you set `device_index` in `config.yaml`, remember the file is tracked in git.** A pull, a
+> merge or a checkout can carry one machine's index onto the other — and two devices on the same
+> index crawl the same slice while nothing crawls the rest. Every run cross-checks the other
+> devices' bucket markers and prints a `⚠` line when it sees that, but it warns rather than
+> refuses. Read the first few lines of a run after changing these.
 
 ---
 
@@ -543,19 +557,30 @@ claims only its own residue class. No coordination, no leases, no shared databas
 ### Setting it up
 
 `prepare` on both devices with the **same scope** — the split is over the manifest, so different
-scopes mean different slices. Then, once per machine:
+scopes mean different slices. Then give each machine its identity, once.
 
-```bash
-# device 1
-export MINIO_ACCESS_KEY=...  MINIO_SECRET_KEY=...
-export ARXIV_CRAWLER_DEVICE=mac-studio
-export ARXIV_CRAWLER_DEVICES=2  ARXIV_CRAWLER_DEVICE_INDEX=0
+Either in that machine's `config.yaml`:
+
+```yaml
+sync:
+  device: linux-box     # a label for the bucket marker
+  devices: 2            # how many machines share the corpus
+  device_index: 1       # which slice this one takes, 0-based
 ```
 
+or in its shell profile, which overrides the file:
+
 ```bash
-# device 2
-export ARXIV_CRAWLER_DEVICE=linux-box
-export ARXIV_CRAWLER_DEVICES=2  ARXIV_CRAWLER_DEVICE_INDEX=1
+export ARXIV_CRAWLER_DEVICE=mac-studio
+export ARXIV_CRAWLER_DEVICES=2
+export ARXIV_CRAWLER_DEVICE_INDEX=0
+```
+
+With `N` devices the indices are `0 … N-1`, up to 256. `--devices` / `--device-index` override
+both, for a one-off run. Credentials stay in the environment either way:
+
+```bash
+export MINIO_ACCESS_KEY=...  MINIO_SECRET_KEY=...
 ```
 
 Then the same command on both:
@@ -581,8 +606,11 @@ python -m src.main status        # "Last bucket sync: ... as device 'mac-studio'
 python -m src.main sync --dry-run
 ```
 
-**The mistake that costs real work** is giving both devices the same `--device-index`: they crawl
-the same half of the corpus and nothing ever touches the other half, silently. Each sync publishes
+**The mistake that costs real work** is giving both devices the same index: they crawl the same
+half of the corpus and nothing ever touches the other half, silently. It is easiest to make by
+setting `device_index` in `config.yaml` and then pulling, merging or checking out that file on the
+other machine — the value travels with it. If you keep the index in the config, keep an eye on
+`git status` before committing. Each sync publishes
 `<prefix>/_state/sync/<device>.json` recording that device's split, and every run reads the
 others' markers and says so:
 
@@ -844,7 +872,7 @@ attempts back into the queue:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-253 tests, no network required. The converter suite is skipped unless `pymupdf` is installed and
+259 tests, no network required. The converter suite is skipped unless `pymupdf` is installed and
 one memory test is Linux-only, so a clean macOS checkout reports `249 passed, 2 skipped`. The
 converter tests generate their fixture PDFs at run time, so no binaries are committed; the
 cooldown tests drive a stubbed HTTP response and the sync tests a fake MinIO client, so nothing
