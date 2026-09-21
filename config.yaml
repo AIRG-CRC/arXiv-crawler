@@ -24,6 +24,20 @@ crawl:
   timeout: 120
   max_attempts: 5
   chunk_size: 65536
+  # --- throttle cooldown ---
+  # A 406 (or 403) from arXiv is the host refusing the client, not a broken paper: it
+  # arrives for every request at once and clears by itself later. Seeing one pauses every
+  # download for `cooldown_seconds` behind a countdown, and the paper is retried afterwards
+  # without spending a retry attempt. Each round the block is still there when the gate
+  # reopens doubles the wait (1h, 2h, 4h, 6h); any civil answer -- a 404 counts -- resets it.
+  # After `cooldown_max_rounds` fruitless rounds the run ends with exit code 75, so a
+  # restart wrapper does not immediately crawl back into the block.
+  # Set `cooldown_seconds: 0` to disable and treat 406 as an ordinary request error.
+  cooldown_statuses: [403, 406]
+  cooldown_seconds: 3600
+  cooldown_max_seconds: 21600
+  cooldown_escalate: true
+  cooldown_max_rounds: 4
 
 convert:
   converter: docling # pymupdf | pdfplumber | docling | opendataloader
@@ -92,6 +106,16 @@ minio:
   secure: false # the endpoint above is plain HTTP
   access_key: null
   secret_key: null
+
+# Reconciling with the bucket before a run, so two devices never convert the same paper.
+# `device` stays null here -- this file is tracked in git. Export instead:
+#   export ARXIV_CRAWLER_DEVICE=mac-studio
+#   export ARXIV_CRAWLER_DEVICES=2  ARXIV_CRAWLER_DEVICE_INDEX=0
+sync:
+  device: null
+  require_meta: true # a paper counts as done only if md AND meta are in the bucket
+  on_start: true # sync automatically at the start of `run-minio`
+  marker: true # publish <prefix>/_state/sync/<device>.json after each sync
 
 postgres:
   dsn: null # e.g. "postgresql://user:pass@localhost:5432/arxiv"

@@ -26,7 +26,8 @@ def collect(manifest: Manifest) -> list[dict]:
     rows = []
     for r in manifest.conn.execute(
         "SELECT arxiv_id, primary_category, pdf_bytes, md_bytes, tables_bytes, "
-        "n_pages, n_tables, low_text FROM papers WHERE status = ? AND md_bytes IS NOT NULL",
+        "n_pages, n_tables, low_text FROM papers "
+        "WHERE status = ? AND md_bytes IS NOT NULL AND pdf_bytes IS NOT NULL",
         (DONE,),
     ):
         pdf = r["pdf_bytes"] or 0

@@ -20,6 +20,7 @@ from .utils.checkpoint import CheckpointStore
 from .utils.converter import REGISTRY
 from .utils.crawler import run_pipeline
 from .utils.logging_setup import configure_logging
+from .utils.partition import DEVICES_ENV, INDEX_ENV, resolve_partition
 from .utils.prepare_data import prepare
 from .utils.state import DONE, FAILED_CONVERT, FAILED_DOWNLOAD, NO_PDF, PENDING, Manifest
 
@@ -27,7 +28,7 @@ log = logging.getLogger("arxiv_crawler")
 
 # Commands that own the terminal with a progress bar: they log to the file and keep
 # stderr clear. The rest are one-shot reports, so their few lines belong on stderr.
-QUIET_COMMANDS = {"run", "run-minio", "dump", "test-paper"}
+QUIET_COMMANDS = {"run", "run-minio", "dump", "test-paper", "sync"}
 
 # Sourced from the registry rather than a hand-written list, so a new backend is
 # selectable the moment it is registered.
@@ -73,10 +74,16 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         convert_converter=args.converter,
         retry_on_start=False if args.no_retry_failed else None,
         retry_max_attempts=args.max_attempts,
+        crawl_cooldown_seconds=args.cooldown_seconds,
     )
     if args.retry_all:
         # `override` skips None values, so the "no ceiling" case is set directly.
         cfg.retry.max_attempts = None
+    try:
+        partition = resolve_partition(args.devices, args.device_index)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if cfg.crawl.contact == "ai@crc.calvin.ac.id":
         # Printed, not just logged, despite `run` being otherwise silent: crawling arXiv
         # without identifying yourself is a policy problem, and a warning nobody sees is
@@ -88,6 +95,7 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
     tallies = run_pipeline(
         cfg, limit=args.limit, keep_pdf=args.keep_pdf, worker_bars=args.worker_bars,
         retry_all=args.retry_all, to_minio=getattr(args, "to_minio", False),
+        partition=partition, sync_bucket=args.sync, claim_any=args.claim_any,
     )
     summary = (
         "processed {processed:,}: {done:,} converted, {no_pdf:,} without a PDF, "
@@ -96,10 +104,24 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
     if tallies.get("retried"):
         summary += f" ({tallies['retried']:,} were retries of earlier failures)"
     log.info("%s", summary)
+    if tallies.get("already_elsewhere"):
+        summary += (f"; {tallies['already_elsewhere']:,} were already in the bucket "
+                    f"and were not re-crawled")
+    if tallies.get("cooldowns"):
+        summary += f"; paused {tallies['cooldowns']} time(s) for arXiv throttling"
     if tallies.get("processed"):
         print(summary)
         if tallies.get("failed"):
             print(f"full detail in {cfg.paths.logs_dir / 'crawler.log'}")
+    if tallies.get("throttled_out"):
+        message = ("arXiv was still refusing requests after the full cooldown ladder, so the "
+                   "run stopped early. Nothing is lost -- outstanding papers are back in the "
+                   "queue. Wait a few hours before running again.")
+        log.warning("%s", message)
+        print(message, file=sys.stderr)
+        # EX_TEMPFAIL. A supervisor or `while true` wrapper that relaunches on 0 would walk
+        # straight back into the block and undo the whole point of the cooldown.
+        return 75
     return 0
 
 
@@ -165,6 +187,72 @@ def cmd_dump(cfg: Config, args: argparse.Namespace) -> int:
     return 1 if report.failed else 0
 
 
+def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
+    """Learn from the bucket what another device has already converted."""
+    from tqdm import tqdm
+
+    from .utils.objectstore import MinioSettings, MinioStore, ObjectStoreError
+    from .utils.sync import run_sync
+
+    try:
+        partition = resolve_partition(args.devices, args.device_index)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    run_marker = cfg.paths.checkpoints_dir / "run.json"
+    if run_marker.exists() and not args.force:
+        # That file exists exactly while a run is in flight, or after one was interrupted.
+        # Syncing under a live run is safe -- in_flight rows are excluded -- but it is much
+        # more likely to be a mistake than an intention.
+        print(f"a run appears to be in flight ({run_marker}). Papers it holds are left "
+              f"alone; pass --force to sync anyway.", file=sys.stderr)
+        return 2
+
+    try:
+        settings = MinioSettings.from_config(cfg.minio)
+        settings.validate()
+        store = MinioStore(settings)
+        # `bucket_present`, not `ensure_bucket`: a reader that creates a missing bucket turns
+        # a typo into an empty new bucket and then reports nothing to do.
+        if not store.bucket_present():
+            print(f"error: no bucket {settings.bucket!r} at {settings.endpoint}",
+                  file=sys.stderr)
+            return 2
+    except ObjectStoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:                # noqa: BLE001 - an unreachable host, usually
+        log.error("could not reach the bucket", exc_info=exc)
+        print(f"error: could not reach the bucket ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+        return 2
+
+    with Manifest(cfg.paths.manifest_db) as manifest:
+        shards = len(manifest.shards(open_only=True))
+        if not shards:
+            print("nothing to sync — every paper in this manifest is already done")
+            return 0
+        print(f"{'checking' if args.dry_run else 'syncing'} {store.describe()}")
+        bar = tqdm(total=shards, unit="shard", desc="sync", smoothing=0.05)
+        try:
+            report = run_sync(cfg, manifest, store, partition=partition,
+                              dry_run=args.dry_run, progress=bar)
+        except Exception as exc:            # noqa: BLE001 - the network, mid-scan
+            log.error("sync failed", exc_info=exc)
+            print(f"\nerror: sync failed ({type(exc).__name__}: {exc}). Whatever it had "
+                  f"already marked is committed; run it again.", file=sys.stderr)
+            return 2
+        finally:
+            bar.close()
+
+    for line in report.lines():
+        print(f"  {line}")
+    if args.dry_run:
+        print("\n(dry run — the manifest was not changed)")
+    return 0
+
+
 def cmd_test_paper(cfg: Config, args: argparse.Namespace) -> int:
     """Delegates to `src.test_paper`, so the two entry points cannot drift apart."""
     from .test_paper import run as run_test_paper
@@ -182,6 +270,17 @@ def cmd_status(cfg: Config, _args: argparse.Namespace) -> int:
             return 0
 
         print(f"\nManifest: {cfg.paths.manifest_db}")
+        marker = cfg.paths.sync_state
+        if marker.exists():
+            try:
+                import json
+
+                state = json.loads(marker.read_text(encoding="utf-8"))
+                print(f"Last bucket sync: {state.get('synced_at', '?')} "
+                      f"as device '{state.get('device', '?')}' "
+                      f"({state.get('report', {}).get('newly_marked', 0):,} marked done)")
+            except (OSError, ValueError):
+                pass
         print(f"{'status':<18}{'papers':>12}{'share':>9}")
         print("-" * 39)
         for status in (DONE, PENDING, NO_PDF, FAILED_DOWNLOAD, FAILED_CONVERT):
@@ -217,11 +316,21 @@ def cmd_retry(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
+    """Cross-check the manifest against the files on disk.
+
+    Rows flagged `remote_only` are skipped rather than checked: their artefacts were
+    uploaded and the local copies removed, which is the whole point of `run-minio` and of
+    `sync`. Checking them against disk reported every paper of a bucket-backed corpus as
+    missing -- and `--fix` then re-queued the entire corpus, discarding weeks of work.
+    """
     data_dir = cfg.paths.data_dir
     missing: list[str] = []
     with Manifest(cfg.paths.manifest_db) as m:
-        checked = 0
+        checked = remote = 0
         for row in m.conn.execute("SELECT * FROM papers WHERE status = ?", (DONE,)):
+            if row["remote_only"]:
+                remote += 1
+                continue
             checked += 1
             aid = row["arxiv_id"]
             expected = [P.md_path(data_dir, aid), P.meta_path(data_dir, aid)]
@@ -230,13 +339,26 @@ def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
             if any(not p.exists() for p in expected):
                 missing.append(aid)
 
-        print(f"checked {checked:,} paper(s) marked done; {len(missing):,} missing files")
+        print(f"checked {checked + remote:,} paper(s) marked done")
+        if remote:
+            print(f"  {remote:,} stored remotely (not checked against disk)")
+        print(f"  {checked:,} checked on disk; {len(missing):,} missing files")
         for aid in missing[:20]:
             print(f"  missing output: {aid}")
         if len(missing) > 20:
             print(f"  ... and {len(missing) - 20:,} more")
 
         if missing and args.fix:
+            # A `--fix` that would re-queue most of the corpus is far likelier to be a
+            # misconfigured data_dir, or a `remote_only` flag that never got set, than a
+            # genuine mass deletion. Re-downloading and re-converting 200,000 papers is not
+            # something to do on an inference from a directory listing.
+            share = len(missing) / checked if checked else 0.0
+            if share > 0.5 and not args.force:
+                print(f"\nrefusing to re-queue {share:.0%} of the papers checked on disk. "
+                      f"If the local copies really are gone, re-run with --fix --force; if "
+                      f"they are in the bucket, run `sync` instead.", file=sys.stderr)
+                return 2
             m.conn.executemany(
                 "UPDATE papers SET status = ?, error = 'outputs missing' WHERE arxiv_id = ?",
                 [(PENDING, aid) for aid in missing],
@@ -300,6 +422,26 @@ def build_parser() -> argparse.ArgumentParser:
                                  "(default: retry.max_attempts in config.yaml)")
         parser.add_argument("--worker-bars", action="store_true",
                             help="one progress line per conversion worker, under the main bar")
+        parser.add_argument("--devices", type=int, metavar="N",
+                            help="how many devices are sharing this corpus "
+                                 f"(default: ${DEVICES_ENV}, else 1)")
+        parser.add_argument("--device-index", type=int, metavar="I",
+                            help="which slice this device takes, 0-based (default: "
+                                 f"${INDEX_ENV}, else 0). Two devices must never share an "
+                                 "index: each would crawl the same half of the corpus and "
+                                 "neither would touch the other")
+        parser.add_argument("--claim-any", action="store_true",
+                            help="once this device's slice is drained, take papers from "
+                                 "outside it (each checked against the bucket first)")
+        parser.add_argument("--sync", dest="sync", action="store_true", default=None,
+                            help="reconcile with the bucket before crawling "
+                                 "(default: sync.on_start, for run-minio only)")
+        parser.add_argument("--no-sync", dest="sync", action="store_false",
+                            help="skip the bucket reconciliation")
+        parser.add_argument("--cooldown", type=int, dest="cooldown_seconds", metavar="SECONDS",
+                            help="pause every download this long when arXiv answers 406/403, "
+                                 "doubling each round it persists; 0 disables "
+                                 "(default: crawl.cooldown_seconds)")
         return parser
 
     sr = add_run_flags(sub.add_parser("run", help="download and convert, in parallel"))
@@ -331,6 +473,17 @@ def build_parser() -> argparse.ArgumentParser:
                      help="print the first N characters of the markdown")
     stp.set_defaults(func=cmd_test_paper)
 
+    sy = sub.add_parser("sync",
+                        help="mark papers done that another device already put in the bucket")
+    sy.add_argument("--dry-run", action="store_true",
+                    help="report what would be marked, changing nothing")
+    sy.add_argument("--devices", type=int, metavar="N",
+                    help="recorded in this device's marker, for the partition cross-check")
+    sy.add_argument("--device-index", type=int, metavar="I")
+    sy.add_argument("--force", action="store_true",
+                    help="sync even though a run looks like it is in flight")
+    sy.set_defaults(func=cmd_sync)
+
     ss = sub.add_parser("status", help="progress report")
     ss.set_defaults(func=cmd_status)
 
@@ -346,6 +499,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sv = sub.add_parser("verify", help="cross-check the manifest against files on disk")
     sv.add_argument("--fix", action="store_true", help="re-queue papers whose outputs vanished")
+    sv.add_argument("--force", action="store_true",
+                    help="with --fix, re-queue even when most papers look missing")
     sv.set_defaults(func=cmd_verify)
 
     return p
