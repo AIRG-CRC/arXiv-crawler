@@ -17,6 +17,15 @@ from src.utils.objectstore import (
 )
 
 
+class FakeObject:
+    """The three attributes of a listed object that anything here reads."""
+
+    def __init__(self, name, size=0, last_modified=None):
+        self.object_name = name
+        self.size = size
+        self.last_modified = last_modified
+
+
 class FakeClient:
     """Records what the SDK would have been asked to do."""
 
@@ -25,6 +34,8 @@ class FakeClient:
         self.fail_on = set(fail_on)
         self.buckets: set[str] = set()
         self.calls: list[tuple[str, str]] = []
+        self.modified: dict[str, object] = {}
+        self.listings: list[str | None] = []      # every prefix that was listed
 
     def bucket_exists(self, bucket):
         return bucket in self.buckets
@@ -39,10 +50,47 @@ class FakeClient:
         with open(path, "rb") as fh:
             self.objects[name] = fh.read()
 
+    def put_object(self, bucket, name, data, length, content_type=None):
+        if name in self.fail_on:
+            raise RuntimeError("upload rejected")
+        self.calls.append(("put", name))
+        self.objects[name] = data.read()
+
+    def get_object(self, bucket, name):
+        if name not in self.objects:
+            raise RuntimeError("not found")
+        return _FakeResponse(self.objects[name])
+
     def stat_object(self, bucket, name):
         if name not in self.objects:
             raise RuntimeError("not found")
         return object()
+
+    def list_objects(self, bucket, prefix=None, recursive=False, start_after=None):
+        self.listings.append(prefix)
+        # Sorted, because that is the ordering real S3 listings guarantee and the one the
+        # prefix and start_after logic is written against.
+        for name in sorted(self.objects):
+            if prefix and not name.startswith(prefix):
+                continue
+            if start_after and name <= start_after:
+                continue
+            yield FakeObject(name, len(self.objects[name]), self.modified.get(name))
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+        self.closed = False
+
+    def read(self):
+        return self.payload
+
+    def close(self):
+        self.closed = True
+
+    def release_conn(self):
+        pass
 
 
 def _store(client=None, prefix="arxiv"):

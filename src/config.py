@@ -29,21 +29,27 @@ class Paths:
             else _abs(self.metadata_file)
         )
 
+    # These four must agree with utils/paths.py, which is where every actual read and
+    # write of an artefact resolves its location -- and which the bucket layout mirrors
+    # through objectstore.local_to_object. They used to say data/processed/<kind> while
+    # paths.py said data/<kind>, so the end-of-run sweep and `verify` looked for staged
+    # PDFs in a directory nothing ever wrote to, and no leftover was ever cleaned up.
+    # tests/test_paths.py pins the agreement.
     @property
     def md_dir(self) -> Path:
-        return self.data_dir / "processed" / "md"
+        return self.data_dir / "md"
 
     @property
     def tables_dir(self) -> Path:
-        return self.data_dir / "processed" / "tables"
+        return self.data_dir / "tables"
 
     @property
     def meta_dir(self) -> Path:
-        return self.data_dir / "processed" / "meta"
+        return self.data_dir / "meta"
 
     @property
     def tmp_dir(self) -> Path:
-        return self.data_dir / "processed" / "tmp"
+        return self.data_dir / "tmp"
 
     @property
     def eda_dir(self) -> Path:
@@ -60,6 +66,12 @@ class Paths:
     @property
     def manifest_db(self) -> Path:
         return self.data_dir / "manifest.db"
+
+    @property
+    def sync_state(self) -> Path:
+        """Last bucket sync, for `status`. Deliberately not under checkpoints/: the
+        `checkpoint --clear` command globs every *.json in that directory."""
+        return self.data_dir / "sync-state.json"
 
     def ensure(self) -> None:
         """Create every output directory"""
@@ -91,6 +103,18 @@ class Crawl:
     timeout: int = 60
     max_attempts: int = 5
     chunk_size: int = 65536
+    # --- throttle cooldown ---
+    # arXiv answers 406 (sometimes 403) when it decides a client is asking for too much.
+    # It is not a fact about the paper, so it must not be handled as a per-paper error:
+    # seeing one of these statuses pauses EVERY download for `cooldown_seconds`, doubling
+    # each round the block is still there, up to `cooldown_max_seconds`. The paper is then
+    # retried without spending an attempt. After `cooldown_max_rounds` fruitless rounds the
+    # run ends with exit code 75. Set `cooldown_seconds: 0` to restore the old behaviour.
+    cooldown_statuses: list[int] = field(default_factory=lambda: [403, 406])
+    cooldown_seconds: int = 3600
+    cooldown_max_seconds: int = 21600
+    cooldown_escalate: bool = True
+    cooldown_max_rounds: int = 4
 
 
 @dataclass
@@ -172,6 +196,23 @@ class Minio:
 
 
 @dataclass
+class Sync:
+    """Reconciling the local manifest against the shared bucket before a run.
+
+    `device` is deliberately null here: this file is tracked in git, so a per-device value
+    conflicts on every pull. Set ARXIV_CRAWLER_DEVICE in the environment instead -- the
+    same convention the MinIO credentials use.
+    """
+    device: str | None = None
+    # Require a meta object as well as an md object before believing a paper is finished.
+    # The upload order is md -> tables -> meta, so a device killed between the first and
+    # the last leaves an md with no meta, and nobody would ever produce it.
+    require_meta: bool = True
+    on_start: bool = True          # sync automatically at the start of `run-minio`
+    marker: bool = True            # publish <prefix>/_state/sync/<device>.json
+
+
+@dataclass
 class Postgres:
     """Defines the postgres ingestion status"""
     dsn: str | None = None
@@ -186,11 +227,13 @@ class Config:
     convert: Convert = field(default_factory=Convert)
     retry: Retry = field(default_factory=Retry)
     minio: Minio = field(default_factory=Minio)
+    sync: Sync = field(default_factory=Sync)
     postgres: Postgres = field(default_factory=Postgres)
 
     SECTIONS: ClassVar[dict[str, type]] = {
         "paths": Paths, "scope": Scope, "crawl": Crawl,
-        "convert": Convert, "retry": Retry, "minio": Minio, "postgres": Postgres,
+        "convert": Convert, "retry": Retry, "minio": Minio, "sync": Sync,
+        "postgres": Postgres,
     }
 
     @classmethod

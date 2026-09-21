@@ -1119,6 +1119,10 @@ def convert_and_write(
                     md_bytes=md_bytes, tables_bytes=tables_bytes,
                     n_pages=result.n_pages, n_tables=result.n_tables,
                     n_chars=result.n_chars, low_text=low_text,
+                    # The upload removes the local copy, so `verify` must not go looking
+                    # for it on disk -- without this flag it reports every paper of a
+                    # run-minio corpus as missing, and `--fix` re-queues the lot.
+                    remote_only=bool(minio),
                     count_attempt=True, worker_id=worker_id, converter=name,
                 )
 

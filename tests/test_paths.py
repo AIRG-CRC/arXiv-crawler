@@ -47,3 +47,21 @@ def test_tables_link_resolves_from_the_md_file():
     source = md_path(root, "2301.12345")
     resolved = (source.parent / tables_link("2301.12345")).resolve()
     assert resolved == tables_path(root, "2301.12345").resolve()
+
+
+def test_config_directories_agree_with_the_path_helpers(tmp_path):
+    """The two must never drift again.
+
+    `Paths.*_dir` and `utils.paths.*_path` are separate statements of the same layout.
+    While they disagreed, `run` wrote staged PDFs to data/tmp/ and the end-of-run sweep
+    cleaned data/processed/tmp/, so every interrupted download leaked a file that nothing
+    ever reported.
+    """
+    from src.config import Paths
+
+    paths = Paths(data_dir=tmp_path)
+    aid = "2301.00001"
+    assert md_path(tmp_path, aid).parent.parent == paths.md_dir
+    assert tables_path(tmp_path, aid).parent.parent == paths.tables_dir
+    assert meta_path(tmp_path, aid).parent.parent == paths.meta_dir
+    assert staged_pdf_path(tmp_path, aid).parent == paths.tmp_dir

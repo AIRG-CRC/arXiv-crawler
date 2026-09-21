@@ -16,4 +16,5 @@ psycopg[binary]>=3.1      # src/scripts/ingest_postgres.py
 pdfplumber>=0.11          # --converter pdfplumber      (MIT alternative)
 docling>=2.0              # --converter docling         (slow, best tables)
 # opendataloader-pdf>=2.0   # --converter opendataloader  (requires JDK 11+)
-markitdown>=0.1minio>=7.2               # object storage for the converted corpus
+markitdown>=0.1           # --converter markitdown
+minio>=7.2                # object storage for the converted corpus

@@ -19,12 +19,16 @@ data/meta/2301/2301.12345.json          title, authors, date, doi, categories, .
 ## Contents
 
 - [How it works](#how-it-works)
+- [Life of a paper](#life-of-a-paper)
 - [Quickstart](#quickstart)
 - [Output format](#output-format)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
 - [Retries](#retries)
+- [When arXiv throttles you](#when-arxiv-throttles-you)
 - [Terminal output](#terminal-output)
+- [Object storage](#object-storage)
+- [Running on two devices](#running-on-two-devices)
 - [Converter backends](#converter-backends)
 - [Optional: Postgres catalog](#optional-postgres-catalog)
 - [arXiv usage policy](#arxiv-usage-policy)
@@ -39,18 +43,21 @@ data/meta/2301/2301.12345.json          title, authors, date, doi, categories, .
 
 ```
                     ┌──────────── data/manifest.db (SQLite, WAL) ────────────┐
-                    │            one writer thread, results queue            │
-                    └──────────▲──────────────────────────▲──────────────────┘
+       sync ───────►│            one writer thread, results queue            │
+   (bucket state)   └──────────▲──────────────────────────▲──────────────────┘
                                │                          │
   metadata JSONL ──► prepare ──┘   [pending rows]         │
+                                    in this device's      │
+                                    slice only            │
                                         │                 │
                           ThreadPoolExecutor(N)   ProcessPoolExecutor(M)
                           download → data/tmp/ ──► convert → md/ tables/ meta/
-                            (global token bucket)      └─► delete the PDF
+                            (token bucket +             └─► delete the PDF,
+                             cooldown gate)                 upload if run-minio
                                      bounded queue
 ```
 
-Three ideas carry the design:
+Four ideas carry the design:
 
 **Two pools, because the work has two shapes.** Downloading is IO-bound and rate-capped, so it
 runs on threads. PDF parsing is CPU-bound inside a C extension that can segfault on a malformed
@@ -60,9 +67,39 @@ file, so it runs on processes — a crash costs one worker, not the run.
 queue. That sidesteps SQLite lock contention rather than fighting it with retries, and it means
 the manifest is consistent no matter when you interrupt.
 
-**The manifest is the source of truth.** `data/manifest.db` records the state of every paper.
-Resuming is just "claim the rows that aren't done yet", and `verify` cross-checks it against what
-is really on disk.
+**The manifest is the source of truth — locally.** `data/manifest.db` records the state of every
+paper. Resuming is just "claim the rows that aren't done yet", and `verify` cross-checks it
+against what is really on disk.
+
+**The bucket is the source of truth between devices.** Each device has its own manifest, so
+neither knows what the other has finished. An object at `arxiv/md/<shard>/<id>.md` is proof that
+a paper is converted, whoever converted it — so a run starts by reading the bucket back into the
+manifest, and the queue is split by a hash of the arXiv id so two devices never claim the same
+paper. See [Running on two devices](#running-on-two-devices).
+
+---
+
+## Life of a paper
+
+What actually happens to `2301.12345`, and which module does it. This is the map to read the
+code by.
+
+| # | Step | Where |
+|---|---|---|
+| 1 | The snapshot record is parsed and inserted as a `pending` row, with its `yymm` shard and its partition key `crc32(id) % 256`. | [`prepare_data.py`](src/utils/prepare_data.py), [`partition.py`](src/utils/partition.py) |
+| 2 | A run opens. Rows left `in_flight` by a crash go back to `pending`; the bucket is listed and anything another device already converted is marked `done`. | [`state.py`](src/utils/state.py) `reset_stale`, [`sync.py`](src/utils/sync.py) |
+| 3 | The paper is **claimed** — one `UPDATE ... RETURNING`, filtered to this device's slice, so no two workers and no two devices can hold it at once. | [`state.py`](src/utils/state.py) `claim_batch` |
+| 4 | A download thread waits at the cooldown gate, takes a token from the global bucket, and fetches `/pdf/2301.12345v2` into `data/tmp/`, checking the body really starts with `%PDF-`. | [`crawler.py`](src/utils/crawler.py) `download_one` |
+| 5 | The staged PDF crosses into a **process** pool — bounded, so `tmp/` cannot fill if conversion falls behind. | [`crawler.py`](src/utils/crawler.py) `run_pipeline` |
+| 6 | A worker converts it: body text in reading order, tables lifted out, a fallback backend if the configured one fails or times out. | [`converter.py`](src/utils/converter.py) `convert_and_write` |
+| 7 | Three files are written atomically — `md`, `tables`, `meta` — and, with `run-minio`, each is uploaded and then unlinked. | [`writer.py`](src/utils/writer.py), [`objectstore.py`](src/utils/objectstore.py) |
+| 8 | The PDF is deleted and the heap handed back. The result goes on a queue. | [`converter.py`](src/utils/converter.py), [`memory.py`](src/utils/memory.py) |
+| 9 | One writer thread applies the result to the manifest in a batched transaction: status, sizes, page and table counts, attempt count. | [`state.py`](src/utils/state.py) `ManifestWriter` |
+
+A failure at step 4 or 6 re-enters at step 3 — immediately if the run still has an in-run retry
+for it, otherwise at the start of the next run. A throttle at step 4 is not a failure at all: it
+parks every download thread until the block lifts and then re-enters at step 4 with no attempt
+spent.
 
 ---
 
@@ -82,6 +119,10 @@ python3 -m venv .venv && .venv/bin/python -m pip install --upgrade pip
 
 > If `pip` appears to hang for minutes with no output, it is almost certainly the macOS keyring
 > lookup, not the network. Re-run with `PIP_KEYRING_PROVIDER=disabled`.
+
+> If you installed before this note existed, re-run the install: two requirements were stuck
+> together on one line in `requirements.txt`, so `minio` was silently never installed and every
+> object-storage command failed with "the minio package is not installed".
 
 ### 2. Get the metadata snapshot
 
@@ -228,29 +269,57 @@ reproducible rather than tracking a moving `/pdf/<id>`.
 ```bash
 python -m src.main run [--download-workers N] [--convert-workers M] [--rps R] [--burst B]
                        [--converter NAME] [--limit N] [--keep-pdf]
-                       [--no-retry-failed] [--max-attempts N] [--worker-bars]
+                       [--no-retry-failed] [--retry-all] [--max-attempts N]
+                       [--worker-bars] [--devices N] [--device-index I]
+                       [--claim-any] [--sync | --no-sync] [--cooldown SECONDS]
 ```
 Downloads and converts in parallel. `Ctrl-C` once to stop cleanly (in-flight work finishes, staged
 PDFs are cleared, the manifest is left consistent); twice to abort.
 
 Every run **opens with the papers an earlier run failed on**, ahead of any fresh work, so a
-transient failure heals by itself — see [Retries](#retries). `--worker-bars` adds one progress
-line per conversion worker under the main bar.
+transient failure heals by itself — see [Retries](#retries).
+
+| Flag | Effect |
+|---|---|
+| `--download-workers N` | Download threads. Raises concurrency, never the request rate. |
+| `--convert-workers M` | Conversion processes. Each docling worker costs ~2 GB VRAM and ~3.7 GB RAM. |
+| `--rps R` / `--burst B` | The global token bucket, shared by every download thread. |
+| `--converter NAME` | Backend for this run. See [Converter backends](#converter-backends). |
+| `--limit N` | Stop after N newly claimed papers. Requeues do not spend the budget. |
+| `--keep-pdf` | Keep staged PDFs instead of deleting them after conversion. Debugging. |
+| `--no-retry-failed` | Skip the retry-first pass and go straight to `pending`. |
+| `--retry-all` | Retry every failed paper, ignoring `retry.max_attempts`. |
+| `--max-attempts N` | Lifetime attempt ceiling for the retry pass. |
+| `--worker-bars` | One progress line per conversion worker, under the main bar. |
+| `--devices N`, `--device-index I` | This device's slice of the queue. See [Running on two devices](#running-on-two-devices). |
+| `--claim-any` | Once this slice drains, take papers from outside it (bucket-checked first). |
+| `--sync` / `--no-sync` | Force or skip the start-of-run bucket reconciliation. |
+| `--cooldown SECONDS` | Pause length when arXiv throttles; `0` disables. See [When arXiv throttles you](#when-arxiv-throttles-you). |
+
+Exit codes: `0` normally, `130` on `Ctrl-C`, **`75`** when the run stopped because arXiv would not
+stop refusing it — a restart wrapper must treat 75 as "wait", not "try again now".
 
 ```bash
 python -m src.main run-minio [same flags as run]
+python -m src.main sync [--dry-run] [--devices N] [--device-index I] [--force]
 python -m src.main dump [--keep-local] [--skip-existing] [--limit N] [--dry-run]
 python -m src.main test-paper <id> [--converter NAME] [--minio] [--show N]
 ```
 Object storage. `run-minio` is `run` with the output sent to MinIO instead of kept on
-disk; `dump` migrates a corpus that is already local; `test-paper` puts one paper through
-the whole path without touching the manifest. See [Object storage](#object-storage).
+disk; `sync` marks papers done that another device already put in the bucket (`run-minio` does
+this for you at startup); `dump` migrates a corpus that is already local; `test-paper` puts one
+paper through the whole path without touching the manifest. See
+[Object storage](#object-storage) and [Running on two devices](#running-on-two-devices).
 
 ```bash
-python -m src.main status     # counts by status, output size, tables extracted
-python -m src.main verify     # cross-check the manifest against files on disk; --fix re-queues
+python -m src.main status       # counts by status, output size, tables extracted, last sync
+python -m src.main verify       # cross-check the manifest against files on disk
+python -m src.main checkpoint   # per-worker progress of the current or last run; --clear
 python -m src.main retry --stage {download,convert,all} [--max-attempts N]
 ```
+`verify --fix` re-queues papers whose outputs have vanished. It **skips papers stored remotely**,
+and refuses outright if more than half of what it checked looks missing — that pattern is far more
+likely to be a wrong `data_dir` than a real mass deletion. `--fix --force` overrides it.
 
 ```bash
 python -m src.scripts.compare_size [--csv report.csv] [--top N]
@@ -273,17 +342,53 @@ All defaults live in [`config.yaml`](config.yaml); CLI flags override them per f
 | `crawl.contact` | placeholder | **Set this.** arXiv asks automated clients to identify themselves. |
 | `crawl.rate_per_sec` | `1.0` | Global ceiling, shared by every worker. |
 | `crawl.burst` | `4` | Token bucket depth. |
-| `crawl.workers` | `4` | Download threads. |
-| `convert.workers` | `8` | Conversion processes. |
-| `convert.timeout` | `120` | Seconds per PDF; enforced with `SIGALRM` inside the worker. |
+| `crawl.workers` | `1` | Download threads. |
+| `crawl.timeout` | `120` | Seconds per HTTP request. |
+| `crawl.max_attempts` | `5` | Tries per paper per run before it is recorded as failed. |
+| `crawl.chunk_size` | `65536` | Streaming read size. |
+| `crawl.cooldown_statuses` | `[403, 406]` | Statuses that mean "arXiv is refusing us", not "this paper is broken". |
+| `crawl.cooldown_seconds` | `3600` | First pause length. `0` disables the whole mechanism. |
+| `crawl.cooldown_max_seconds` | `21600` | Ceiling on the escalating pause. |
+| `crawl.cooldown_escalate` | `true` | Double the pause each round the block persists. |
+| `crawl.cooldown_max_rounds` | `4` | Fruitless rounds before the run gives up (exit 75). |
+| `convert.workers` | `4` | Conversion processes. `null` derives it from the core count. |
+| `convert.timeout` | `1500` | Seconds per PDF; enforced with `SIGALRM` inside the worker. |
+| `convert.device` | `auto` | `auto`, `cpu` or `cuda`. Pin it to catch a silent fall back to CPU. |
+| `convert.num_threads` | `null` | CPU threads per worker; `null` derives `cores // workers`. |
+| `convert.pdf_backend` | `pypdfium` | docling's text backend. See the note in `config.yaml`. |
+| `convert.fallback_converter` | `pymupdf` | Tried when the configured backend fails. `null` disables. |
+| `convert.max_tasks_per_child` | `100` | Retire a conversion worker after N papers, bounding heap drift. |
+| `convert.memory_floor` | `0.12` | Pause dispatch below this much free RAM. Fraction, `"4GB"`, or `null`. |
 | `convert.max_pages` | `300` | Longer documents are truncated, not failed. |
 | `convert.table_strategy` | `lines_strict` | See [Converter backends](#converter-backends). |
 | `convert.table_fallback_strategy` | `null` | Leave off — see the note in `config.yaml`. |
 | `convert.min_chars_per_page` | `100` | Below this a paper is flagged `low_text`. |
+| `convert.detect_pseudocode` | `true` | Keep algorithm blocks as fenced code rather than prose. |
+| `convert.preserve_equations` | `true` | Keep the text layer's equation approximation inline. |
+| `convert.max_table_columns` | `25` | Wider tables are treated as layout, not data. |
 | `retry.on_start` | `true` | Re-attempt earlier failures at the start of every `run`. |
-| `retry.max_attempts` | `4` | Total tries a paper ever gets before `run` stops picking it up. |
+| `retry.max_attempts` | `4` | Total tries a paper ever gets before `run` stops picking it up. `null` = no ceiling. |
+| `retry.in_run` | `true` | Retry a failed paper inside the run that failed it. |
+| `retry.in_run_attempts` | `1` | Extra in-run tries before the run gives up on a paper. |
+| `minio.endpoint` | `10.3.18.40:9000` | Host and port. Credentials come from the environment. |
+| `minio.bucket` / `minio.prefix` | `airg` / `arxiv` | Everything lands under `<bucket>/<prefix>/`. |
+| `minio.secure` | `false` | `true` for HTTPS endpoints. |
+| `sync.device` | `null` | This device's name in the bucket. **Set `ARXIV_CRAWLER_DEVICE` instead.** |
+| `sync.require_meta` | `true` | A paper counts as done only if *both* its `md` and `meta` objects exist. |
+| `sync.on_start` | `true` | Reconcile with the bucket at the start of every `run-minio`. |
+| `sync.marker` | `true` | Publish `<prefix>/_state/sync/<device>.json` after each sync. |
 
 Raising `crawl.workers` increases concurrency, **never** the request rate past `rate_per_sec`.
+
+**Three settings belong in the environment, not in this file**, because `config.yaml` is tracked
+in git and a per-device value there conflicts on every pull:
+
+```bash
+export MINIO_ACCESS_KEY=...  MINIO_SECRET_KEY=...
+export ARXIV_CRAWLER_DEVICE=mac-studio          # this machine's name in the bucket
+export ARXIV_CRAWLER_DEVICES=2                  # how many devices share the corpus
+export ARXIV_CRAWLER_DEVICE_INDEX=0             # which slice this one takes
+```
 
 ---
 
@@ -311,6 +416,58 @@ for a run that should only chew through fresh work.
 
 > A `failed_convert` retry **re-downloads**, because the PDF is deleted after every attempt. That
 > costs a request against the rate limit, so the attempt ceiling is doing real work.
+
+---
+
+## When arXiv throttles you
+
+Sooner or later the export host stops answering:
+
+```
+  ↻ 0708.1102 failed (HTTPError: 406 Client Error: Not Acceptable) — retrying now
+  ↻ 0708.1105 failed (HTTPError: 406 Client Error: Not Acceptable) — retrying now
+```
+
+**A 406 or 403 is not a fact about the paper.** The same id fetches fine an hour later, and every
+request in flight gets the same answer at the same moment — it is arXiv refusing this IP. Treated
+as an ordinary error, it is the worst possible outcome: each paper burns all five of its attempts
+inside a few seconds of backoff and is then recorded `failed_download` with a lifetime attempt
+spent. The crawler makes its heaviest burst of requests at exactly the moment arXiv is refusing
+them, and marks hundreds of perfectly good papers bad.
+
+So a throttle stops **every** download instead:
+
+```
+  ⏸ arXiv answered HTTP 406 on 0708.1102 — pausing every download for 1h00m (cooldown 1 of 4)
+  ⏸ arXiv HTTP 406 — 41m18s left ███████▌
+  ▶ resuming after 1h00m
+```
+
+- The pause is **global**. One thread runs the countdown; the rest park behind a gate. A 406 that
+  was already in flight when the gate closed does not start a second pause on top of the first.
+- **No attempt is spent.** Waiting out a block is not a try, so the paper is fetched again
+  afterwards with its retry budget intact.
+- If the block is still there when the gate reopens, the wait **doubles** — 1h, 2h, 4h, 6h. Any
+  civil answer resets it, and a 404 counts: it proves the host is talking to us.
+- On resuming, the token bucket is **emptied** first. It had refilled to `burst` while we waited,
+  and firing four requests at a server that was blocking us is how the block was earned.
+- `Retry-After`, when arXiv sends one, raises the wait. It is better information than a guess.
+- Conversion carries on throughout — whatever is already downloaded still gets converted.
+- `Ctrl-C` interrupts the wait within a second and shuts the run down cleanly.
+
+After `crawl.cooldown_max_rounds` rounds with nothing to show for them (~13 hours by default) the
+run stops and **exits 75**. Nothing is lost: outstanding papers go back to `pending`. The non-zero
+exit matters if you run under a supervisor — a wrapper that relaunches on exit 0 would walk
+straight back into the block and defeat the whole mechanism.
+
+A 200 whose body is an HTML block page is caught too. arXiv also answers 200 with a "PDF is being
+generated, retry shortly" interstitial, which genuinely *is* per-paper, and only the body
+distinguishes them — so the sniff is deliberately conservative and every non-PDF body is logged
+with its first 200 bytes. To watch the whole mechanism without waiting an hour:
+
+```bash
+python -m src.main run --cooldown 10 --limit 5
+```
 
 ---
 
@@ -367,6 +524,95 @@ still on disk is precisely what still needs sending.
 
 `--keep-local` turns `dump` into a copy rather than a move. `--skip-existing` avoids
 re-sending objects already in the bucket, at one HEAD request per file.
+
+---
+
+## Running on two devices
+
+Two machines can crawl the same corpus into the same bucket at the same time. There are two
+problems to solve, and they have separate answers.
+
+**Neither device knows what the other has finished.** Each has its own `manifest.db`. The bucket
+is the shared record, so a `run-minio` starts by listing it and marking those papers `done`
+locally — nothing already converted is ever crawled again.
+
+**Both devices would otherwise claim the same papers.** `claim_batch` is atomic within one SQLite
+file, and there are two files. So the queue is split by `crc32(arxiv_id) % 256`, and each device
+claims only its own residue class. No coordination, no leases, no shared database.
+
+### Setting it up
+
+`prepare` on both devices with the **same scope** — the split is over the manifest, so different
+scopes mean different slices. Then, once per machine:
+
+```bash
+# device 1
+export MINIO_ACCESS_KEY=...  MINIO_SECRET_KEY=...
+export ARXIV_CRAWLER_DEVICE=mac-studio
+export ARXIV_CRAWLER_DEVICES=2  ARXIV_CRAWLER_DEVICE_INDEX=0
+```
+
+```bash
+# device 2
+export ARXIV_CRAWLER_DEVICE=linux-box
+export ARXIV_CRAWLER_DEVICES=2  ARXIV_CRAWLER_DEVICE_INDEX=1
+```
+
+Then the same command on both:
+
+```bash
+python -m src.main run-minio
+```
+
+which opens with something like:
+
+```
+storing to http://10.3.18.40:9000/airg/arxiv
+  scanned 184 shard(s), skipped 41 already complete
+  218,431 object(s) listed in 47.3s
+  marked 1,204 paper(s) done from the bucket
+device slice 1 of 2 — 1,243,905 paper(s) pending in this slice
+```
+
+### Checking it is working
+
+```bash
+python -m src.main status        # "Last bucket sync: ... as device 'mac-studio'"
+python -m src.main sync --dry-run
+```
+
+**The mistake that costs real work** is giving both devices the same `--device-index`: they crawl
+the same half of the corpus and nothing ever touches the other half, silently. Each sync publishes
+`<prefix>/_state/sync/<device>.json` recording that device's split, and every run reads the
+others' markers and says so:
+
+```
+  ⚠ device 'linux-box' is also using --device-index 1: both devices will crawl the same
+    slice and nothing will crawl the others
+```
+
+It warns rather than refuses — a stale marker must never stop a crawl — so the warning is worth
+reading. If you see it, fix the index and run `sync` on both devices; no work is lost, the
+duplicated papers are simply overwritten in place.
+
+### Other things worth knowing
+
+- **The slices are static**, so the faster device idles once its half is done. `--claim-any` lets
+  it take papers from outside its slice at that point, checking the bucket before each download so
+  it does not redo the other device's work. One HEAD per paper is affordable at the tail and
+  nowhere else, which is why it is scoped there.
+- **`sync` is safe to run at any time**, including during a run: papers the local run holds
+  `in_flight` are left alone. It only ever marks papers done — it never re-queues anything.
+- **A paper counts as done only if both its `md` and its `meta` object exist.** Uploads go md →
+  tables → meta, so a device killed between the first and the last leaves an md with no meta. The
+  sync reports those and leaves them for someone to finish rather than declaring victory.
+- **There is deliberately no resume cursor.** A high-water mark over these key names would skip
+  papers permanently: claims come back in rowid order rather than key order, old-style ids shard
+  to `9901` which sorts *after* every modern `2xxx` shard, and `misc` sorts after all of them. The
+  scan skips whole shards that are already complete instead, which is both sound and usually
+  faster.
+- **The device count can change between runs.** Re-slicing only means a given paper is crawled by
+  the other device next time, and the sync reconciles it either way.
 
 ---
 
@@ -533,20 +779,34 @@ attempts back into the queue:
 .venv/bin/python -m src.main retry --stage download --max-attempts 8
 ```
 
-**Outputs deleted by accident.**
+**Outputs deleted by accident.** `verify` reports what is missing; `--fix` re-queues it.
 
 ```bash
+.venv/bin/python -m src.main verify
 .venv/bin/python -m src.main verify --fix
 ```
 
+> **On a bucket-backed corpus, check what `verify` says before using `--fix`.** Papers stored in
+> MinIO have no local copy — that is the point of `run-minio` — and are reported separately as
+> "stored remotely", not as missing. If instead you see most of the corpus reported missing, the
+> likely causes are a `data_dir` pointing somewhere unexpected, or a corpus uploaded by a version
+> that did not record `remote_only`. `--fix` refuses to act on that pattern for exactly this
+> reason; run `sync` first, and only use `--fix --force` if the local files really are gone.
+
 | Symptom | Cause and fix |
 |---|---|
+| `HTTP 406` or `403`, many papers at once | arXiv is refusing this IP, not rejecting the papers. Handled automatically — see [When arXiv throttles you](#when-arxiv-throttles-you). If it keeps happening, lower `--rps`. |
+| The run exited 75 | It waited out the full cooldown ladder and arXiv never relented. Wait a few hours. Do not auto-restart on 75. |
 | Many `failed_download`, `HTTP 429` | Rate limited. Lower `--rps`, wait, retry. |
 | `no_pdf` | Terminal, not an error: withdrawn papers and source-only submissions have no PDF. |
 | `ConversionTimeout` | A pathologically long paper. Raise `convert.timeout`, then `retry --stage convert`. |
 | Papers flagged `low_text` | Pre-2000 scans with no text layer. They need OCR; re-run with `--converter docling`. |
-| `run` says nothing pending | The manifest is empty or complete. Run `prepare` with a wider scope. |
+| `run` says nothing pending | The manifest is empty or complete — or this device's slice is. Check `--device-index`, or run `prepare` with a wider scope. |
+| `verify` says everything is missing | The corpus is in the bucket. See the warning above. |
+| Both devices are crawling the same papers | They share a `--device-index`. See [Running on two devices](#running-on-two-devices). |
+| `bucket sync skipped (...)` | The bucket was unreachable. The run continues from the local manifest; fix the endpoint or credentials and it reconciles next time. |
 | Conversion retry re-downloads | Expected — the PDF was deleted. Use `--keep-pdf` when debugging. |
+| First start after an update is slow | A one-off migration filling the partition key for existing rows. ~8s for 2.7M papers; it is logged. |
 
 ---
 
@@ -566,6 +826,15 @@ attempts back into the queue:
 - **Figures are dropped entirely**, by design. Captions survive as body text; the images do not.
 - **Equations** become the PDF's text-layer approximation, not LaTeX. If you need real math, the
   arXiv LaTeX source is a better input than the PDF.
+- **The device split is static.** Each device gets a fixed hash slice, so the faster one idles once
+  its slice is done unless you pass `--claim-any`; and a device that dies mid-run leaves its slice
+  untouched until it runs again — there is no lease for another device to pick up. Genuine
+  distributed claiming would need a shared manifest (Postgres, say) rather than one SQLite file per
+  device. At two devices that machinery buys nothing the hash split and the bucket sync do not
+  already give.
+- **The bucket scan is a full listing** of every shard that still has unfinished papers in it. That
+  is a few thousand LIST calls on a large corpus — tens of seconds on a LAN, and correct, which a
+  stored cursor would not be.
 
 ---
 
@@ -575,21 +844,31 @@ attempts back into the queue:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-62 tests, no network required. The converter tests generate their fixture PDFs at run time with
-PyMuPDF, so no binaries are committed.
+253 tests, no network required. The converter suite is skipped unless `pymupdf` is installed and
+one memory test is Linux-only, so a clean macOS checkout reports `249 passed, 2 skipped`. The
+converter tests generate their fixture PDFs at run time, so no binaries are committed; the
+cooldown tests drive a stubbed HTTP response and the sync tests a fake MinIO client, so nothing
+reaches the network.
 
 ```
 src/
-├── main.py                    CLI: prepare, run, status, retry, verify
+├── main.py                    CLI: prepare, run, run-minio, sync, status, retry, verify
 ├── config.py                  config.yaml -> dataclasses, with CLI overrides
 ├── utils/
 │   ├── paths.py               ID normalisation and the yymm shard layout
+│   ├── partition.py           which papers belong to this device
 │   ├── logging_setup.py       file-only logging; silences workers so the bar survives
-│   ├── state.py               SQLite manifest, claim/writer machinery
+│   ├── state.py               SQLite manifest, claim/writer machinery, migrations
 │   ├── prepare_data.py        streaming JSONL ingest (shared with the notebook)
 │   ├── crawler.py             rate limiter, HTTP layer, parallel orchestrator
+│   ├── cooldown.py            the global pause for when arXiv stops answering
 │   ├── converter.py           PDF -> Markdown backends + the process-pool task
-│   └── writer.py              atomic serialisation of the three output files
+│   ├── writer.py              atomic serialisation of the three output files
+│   ├── objectstore.py         MinIO: object names, uploads, listings
+│   ├── sync.py                bucket -> manifest reconciliation, device markers
+│   ├── migrate.py             bulk upload of a corpus already on disk
+│   ├── checkpoint.py          per-worker progress files
+│   └── memory.py              the free-RAM guard and the per-paper heap release
 └── scripts/
     ├── compare_size.py        PDF vs Markdown size report
     ├── ingest_postgres.py     bulk load into Postgres

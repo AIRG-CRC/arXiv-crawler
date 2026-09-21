@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -47,6 +48,54 @@ def object_name(kind: str, arxiv_id: str, *, prefix: str = "") -> str:
     }[kind]
     parts = [p for p in (prefix.strip("/"), kind, shard_for(arxiv_id), leaf) if p]
     return "/".join(parts)
+
+
+# What each kind's leaf looks like, so a name can be split back apart. `md` is listed
+# last on purpose: `.tables.md` also ends in `.md`, so it has to be ruled out first.
+_LEAF_SUFFIX = {"tables": ".tables.md", "meta": ".json", "md": ".md"}
+
+
+def id_candidates_from_object_name(
+    name: str, *, prefix: str = "", kind: str = "md"
+) -> tuple[str, ...]:
+    """The arXiv id(s) an object name could have come from; empty if it is not one.
+
+    `safe_id` maps "/" to "_", which is injective over real ids -- modern stems contain no
+    underscore, old-style stems contain exactly one, and no arXiv id contains an underscore
+    -- but rather than lean on that, both readings are returned and the manifest decides.
+    At most one of them can be a row, since one contains a slash and the other does not.
+    """
+    parts = name.rsplit("/", 3)
+    if len(parts) == 4:
+        _head, obj_kind, _shard, leaf = parts
+    elif len(parts) == 3:
+        obj_kind, _shard, leaf = parts
+    else:
+        return ()
+    if obj_kind != kind:
+        return ()
+    suffix = _LEAF_SUFFIX[kind]
+    if kind == "md" and leaf.endswith(_LEAF_SUFFIX["tables"]):
+        return ()                       # a tables object, which also ends in ".md"
+    if not leaf.endswith(suffix) or len(leaf) <= len(suffix):
+        return ()
+    stem = leaf[: -len(suffix)]
+    if "_" not in stem:
+        return (stem,)
+    return (stem, stem.replace("_", "/", 1))
+
+
+def id_from_object_name(name: str, *, prefix: str = "", kind: str = "md") -> str | None:
+    """The one id that maps back to exactly this name, or None.
+
+    Generate-and-verify rather than a second parser: the answer is whichever candidate
+    `object_name` rebuilds into the name we were given, so the inverse cannot drift away
+    from the forward map as the layout changes.
+    """
+    for candidate in id_candidates_from_object_name(name, prefix=prefix, kind=kind):
+        if object_name(kind, candidate, prefix=prefix) == name:
+            return candidate
+    return None
 
 
 def local_to_object(path: Path, data_dir: Path, *, prefix: str = "") -> str | None:
@@ -170,6 +219,21 @@ class MinioStore:
         )
         return len(payload)
 
+    def get_bytes(self, name: str) -> bytes:
+        """Download one small object. Only used for the device markers.
+
+        The SDK hands back a urllib3 response that has to be closed *and* have its
+        connection released, or the pool leaks a socket per call.
+        """
+        response = self.client.get_object(self.settings.bucket, name)
+        try:
+            return response.read()
+        finally:
+            for method in ("close", "release_conn"):
+                closer = getattr(response, method, None)
+                if closer is not None:
+                    closer()
+
     def exists(self, name: str) -> bool:
         try:
             self.client.stat_object(self.settings.bucket, name)
@@ -177,12 +241,50 @@ class MinioStore:
         except Exception:               # the SDK raises S3Error for a missing key
             return False
 
-    def list_names(self, prefix: str | None = None) -> Iterator[str]:
-        target = self.settings.prefix if prefix is None else prefix
+    def bucket_present(self) -> bool:
+        """Does the bucket exist? Unlike `ensure_bucket`, this never creates it.
+
+        Which is what a reader wants: `ensure_bucket` would turn a typo'd bucket name into
+        a new empty bucket, and the sync would then cheerfully report nothing to do.
+        """
+        return bool(self.client.bucket_exists(self.settings.bucket))
+
+    def _iter_raw(
+        self, prefix: str | None, *, start_after: str | None = None
+    ) -> Iterator[tuple[str, int, datetime | None]]:
         for obj in self.client.list_objects(
-            self.settings.bucket, prefix=target or None, recursive=True
+            self.settings.bucket, prefix=prefix or None, recursive=True,
+            start_after=start_after,
         ):
-            yield obj.object_name
+            yield (obj.object_name,
+                   getattr(obj, "size", 0) or 0,
+                   getattr(obj, "last_modified", None))
+
+    def list_names(self, prefix: str | None = None) -> Iterator[str]:
+        """Object names under an absolute prefix (default: the configured one)."""
+        target = self.settings.prefix if prefix is None else prefix
+        for name, _size, _modified in self._iter_raw(target):
+            yield name
+
+    def iter_objects(
+        self, relative: str = "", *, start_after: str | None = None
+    ) -> Iterator[tuple[str, int, datetime | None]]:
+        """`(name, size, last_modified)` for everything under `relative`.
+
+        `relative` is joined onto the configured prefix and given a trailing slash, because
+        a bare "md" would also match an "mdx/" that someone adds later.
+
+        `start_after` resumes a listing within one call. It must **never** be kept as a
+        high-water mark between runs. Object names sort as `md/<shard>/<id>.md`, and
+        (1) claims come back in rowid order, which has nothing to do with key order, so a
+        run writes objects all over the keyspace; (2) old-style ids shard to `9901`, which
+        sorts after every modern `2xxx` shard; (3) `misc` sorts after all of them. Any
+        stored cursor therefore skips papers silently and permanently.
+        """
+        target = "/".join(
+            p for p in (self.settings.prefix.strip("/"), relative.strip("/")) if p
+        )
+        yield from self._iter_raw(f"{target}/" if target else None, start_after=start_after)
 
     def describe(self) -> str:
         scheme = "https" if self.settings.secure else "http"

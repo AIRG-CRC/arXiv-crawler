@@ -33,8 +33,10 @@ from tqdm import tqdm
 
 from .checkpoint import CheckpointStore
 from .converter import convert_and_write
+from .cooldown import Cooldown, looks_like_block_page
 from .logging_setup import console, quiet_worker_logging
 from .memory import MemoryGuard, human, resolve_floor
+from .partition import describe as describe_partition
 from .paths import staged_pdf_path
 from .state import (
     DONE,
@@ -85,12 +87,28 @@ class RateLimiter:
                 wait_for = (1.0 - self._tokens) / self.rate
             time.sleep(min(wait_for, 1.0))
 
+    def drain(self) -> None:
+        """Empty the bucket, so the next request waits a full 1/rate.
+
+        Called on resuming from a cooldown. The bucket refills while nothing is being
+        downloaded, so after an hour's pause it is at `capacity` -- and the first thing a
+        just-lifted block would see is a burst of `burst` requests, which is how the block
+        was earned in the first place.
+        """
+        with self._lock:
+            self._tokens = 0.0
+            self._updated = time.monotonic()
+
 
 class ArxivSession:
     """A `requests` session per thread, with arXiv-appropriate headers."""
 
-    def __init__(self, cfg: Any):
+    def __init__(self, cfg: Any, cooldown: Cooldown | None = None):
         self.cfg = cfg
+        # The cooldown rides here rather than as a parameter to `download_one`: this is
+        # already the per-run "how we talk to arXiv" object, and the fetch signature stays
+        # as it was. A disabled default keeps `ArxivSession(cfg)` usable on its own.
+        self.cooldown = cooldown or Cooldown(stop=threading.Event(), seconds=0)
         self._local = threading.local()
 
     @property
@@ -117,16 +135,25 @@ class DownloadOutcome:
         self.status, self.error = status, error
 
 
+def _retry_after_seconds(response: requests.Response | None) -> float | None:
+    """The `Retry-After` header as seconds, when the server sent a usable one."""
+    if response is None:
+        return None
+    header = response.headers.get("Retry-After")
+    if not header:
+        return None
+    try:
+        return float(header)
+    except ValueError:
+        return None                         # the HTTP-date form; not worth parsing
+
+
 def _sleep_for_retry(response: requests.Response | None, attempt: int, stop: threading.Event) -> None:
     """Exponential backoff with jitter, but honour an explicit Retry-After."""
     delay = min(60.0, 2.0**attempt) + random.uniform(0, 1.0)
-    if response is not None:
-        header = response.headers.get("Retry-After")
-        if header:
-            try:
-                delay = max(delay, float(header))
-            except ValueError:
-                pass
+    explicit = _retry_after_seconds(response)
+    if explicit is not None:
+        delay = max(delay, explicit)
     stop.wait(delay)
 
 
@@ -137,59 +164,110 @@ def download_one(
     data_dir: Path,
     stop: threading.Event,
 ) -> DownloadOutcome:
-    """Fetch one PDF into `data/tmp/`. Never raises; failures come back as a status."""
+    """Fetch one PDF into `data/tmp/`. Never raises; failures come back as a status.
+
+    `attempt` is counted explicitly rather than by a `for` loop because a throttle must not
+    spend one: waiting out a block the server is applying to every request is not an attempt
+    at this paper. `throttle_waits` bounds that separately, so one pathological paper cannot
+    park a download thread indefinitely.
+    """
     cfg = session.cfg
+    cooldown = session.cooldown
     target = staged_pdf_path(data_dir, row.arxiv_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_suffix(".pdf.part")
     url = session.pdf_url(row)
     last_error = "unknown error"
+    attempt = 0
+    throttle_waits = 0
 
-    for attempt in range(cfg.max_attempts):
+    while attempt < cfg.max_attempts:
         if stop.is_set():
             # The user interrupted; this paper did not fail. Hand it straight back to
             # `pending` without burning an attempt, so a plain `run` picks it up again.
+            # Checked *before* the cooldown gate on purpose: on Ctrl-C every queued download
+            # returns here in microseconds instead of blocking on a gate that, mid-cooldown,
+            # nobody is going to reopen in time for `dl_pool.shutdown(wait=True)`.
+            return DownloadOutcome(status=PENDING)
+        generation = cooldown.enter()
+        if generation is None:
             return DownloadOutcome(status=PENDING)
         limiter.acquire()
         response = None
+        throttled: int | None = None
+        retry_after: float | None = None
         try:
             response = session.session.get(url, timeout=cfg.timeout, stream=True)
 
-            if response.status_code == 404:
+            if response.status_code in cooldown.statuses:
+                # First, and before raise_for_status: 403/406 are 4xx, so the generic
+                # handler below would otherwise spend an attempt -- and all five of them
+                # within a few seconds -- on a status that says nothing about this paper.
+                # The wait itself happens after the `try`, once the response is closed.
+                throttled = response.status_code
+                retry_after = _retry_after_seconds(response)
+            elif response.status_code == 404:
+                cooldown.note_clean()
                 return DownloadOutcome(status=NO_PDF, error="404 (withdrawn or no PDF)")
-            if response.status_code in RETRY_STATUS:
+            elif response.status_code in RETRY_STATUS:
                 last_error = f"HTTP {response.status_code}"
                 _sleep_for_retry(response, attempt, stop)
+                attempt += 1
                 continue
-            response.raise_for_status()
+            else:
+                response.raise_for_status()
 
-            digest = hashlib.sha256()
-            size = 0
-            with part.open("wb") as fh:
-                for chunk in response.iter_content(chunk_size=cfg.chunk_size):
-                    if not chunk:
-                        continue
-                    if size == 0 and not chunk.startswith(PDF_MAGIC):
-                        # arXiv answers 200 with an HTML "PDF is being generated"
-                        # interstitial, so the status code alone proves nothing.
-                        raise ValueError("response body is not a PDF")
-                    fh.write(chunk)
-                    digest.update(chunk)
-                    size += len(chunk)
+                digest = hashlib.sha256()
+                size = 0
+                blocked = False
+                with part.open("wb") as fh:
+                    for chunk in response.iter_content(chunk_size=cfg.chunk_size):
+                        if not chunk:
+                            continue
+                        if size == 0 and not chunk.startswith(PDF_MAGIC):
+                            # arXiv answers 200 with HTML for two unrelated reasons: a "PDF
+                            # is being generated" interstitial, which is per-paper and
+                            # transient, and a block page, which is neither. The status code
+                            # proves nothing either way -- only the body separates them.
+                            log.warning("non-PDF body for %s: %r", row.arxiv_id, chunk[:200])
+                            if cooldown.enabled and looks_like_block_page(chunk):
+                                throttled = response.status_code
+                                blocked = True
+                                break
+                            raise ValueError("response body is not a PDF")
+                        fh.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
 
-            if size == 0:
-                raise ValueError("empty response body")
-
-            os.replace(part, target)   # atomic: never leaves a truncated-looking PDF
-            return DownloadOutcome(path=target, size=size, sha256=digest.hexdigest())
+                if blocked:
+                    part.unlink(missing_ok=True)
+                elif size == 0:
+                    raise ValueError("empty response body")
+                else:
+                    os.replace(part, target)   # atomic: never a truncated-looking PDF
+                    cooldown.note_clean()
+                    return DownloadOutcome(path=target, size=size, sha256=digest.hexdigest())
 
         except (requests.RequestException, ValueError, OSError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             part.unlink(missing_ok=True)
             _sleep_for_retry(response, attempt, stop)
+            attempt += 1
+            continue
         finally:
             if response is not None:
                 response.close()
+
+        # Only a throttle reaches here, and only with the response already closed by the
+        # `finally` above: a streamed connection and its pooled socket must not be held open
+        # across a wait measured in hours.
+        last_error = f"HTTP {throttled} (arXiv throttle)"
+        if throttle_waits >= cooldown.max_rounds or not cooldown.trip(
+                generation, throttled, row.arxiv_id, retry_after):
+            # Either this one paper has waited out its share of rounds, or the run is over.
+            # `PENDING` hands it back untouched -- no attempt, no failure recorded.
+            return DownloadOutcome(status=PENDING)
+        throttle_waits += 1
 
     return DownloadOutcome(status=FAILED_DOWNLOAD, error=last_error[:500])
 
@@ -236,6 +314,15 @@ class WorkerBars:
         bar.set_description_str(f"{slot:>2} · {arxiv_id}", refresh=False)
         bar.update(1)
 
+    @property
+    def next_position(self) -> int:
+        """The first free line under the main bar and any worker bars.
+
+        Read from the bars actually constructed rather than recomputed from the worker
+        count, so a caller cannot drift from what `enabled` decided.
+        """
+        return 1 + len(self._bars)
+
     def close(self) -> None:
         for bar in self._bars:
             bar.close()
@@ -249,6 +336,9 @@ def run_pipeline(
     worker_bars: bool = False,
     retry_all: bool = False,
     to_minio: bool = False,
+    partition: tuple[int, int] | None = None,
+    sync_bucket: bool | None = None,
+    claim_any: bool = False,
 ) -> dict[str, int]:
     """Drive download -> convert -> manifest until the queue drains or Ctrl-C arrives.
 
@@ -256,6 +346,10 @@ def run_pipeline(
     on to fresh `pending` work. Retries come first because they are the smaller, more
     informative set: if the converter was broken last run you find out in the first few
     seconds rather than after another hour of new downloads.
+
+    `partition` is this device's `(devices, index)` slice, or None for the whole corpus.
+    Every claim is filtered by it, so two devices running at once never hand the same paper
+    to two converters -- see utils.partition for why the key is hashed from the id.
     """
     cfg.paths.ensure()
     data_dir = cfg.paths.data_dir
@@ -264,20 +358,43 @@ def run_pipeline(
     # downloaded rather than once per worker. Passed to workers as a plain dict because
     # spawn has to pickle it, and a live client cannot cross a process boundary.
     minio_settings: dict[str, Any] | None = None
+    store = None
     if to_minio:
         from .objectstore import MinioSettings, MinioStore
 
         settings = MinioSettings.from_config(cfg.minio)
         settings.validate()
-        probe = MinioStore(settings)
-        probe.ensure_bucket()                  # also proves the endpoint is reachable
-        console("storing to %s", probe.describe())
+        store = MinioStore(settings)
+        store.ensure_bucket()                  # also proves the endpoint is reachable
+        console("storing to %s", store.describe())
         minio_settings = asdict(settings)
 
     manifest = Manifest(cfg.paths.manifest_db)
     reclaimed = manifest.reset_stale()
     if reclaimed:
         log.info("re-queued %d row(s) left in_flight by a previous run", reclaimed)
+
+    # Learn what the other device has already converted, before anything is claimed. This
+    # has to come before the retry snapshot and before `stats()`: a paper that failed here
+    # but converted elsewhere must not be re-downloaded, and `todo` -- including the
+    # "nothing to do" exit -- has to be computed after the reconciliation, or a finished
+    # second device would re-crawl the corpus. The ManifestWriter has not started yet, so
+    # this write is uncontended.
+    wants_sync = (getattr(getattr(cfg, "sync", None), "on_start", True)
+                  if sync_bucket is None else sync_bucket)
+    if wants_sync and store is not None:
+        from .sync import run_sync
+
+        try:
+            report = run_sync(cfg, manifest, store, partition=partition)
+            for line in report.lines():
+                console("  %s", line)
+        except Exception as exc:               # noqa: BLE001
+            # A bucket that cannot be read means crawling from the local manifest alone --
+            # some duplicated work at worst. It must never stop the run.
+            log.warning("bucket sync skipped", exc_info=exc)
+            console("  ⚠ bucket sync skipped (%s: %s) — using the local manifest only",
+                    type(exc).__name__, exc)
 
     # The retry worklist is fixed here, before anything is dispatched -- see
     # Manifest.claimable_ids for why it is a snapshot and not a repeated query.
@@ -290,13 +407,21 @@ def run_pipeline(
     in_run_enabled = bool(getattr(retry_cfg, "in_run", True))
     retry_ids: list[str] = []
     if getattr(retry_cfg, "on_start", True):
-        retry_ids = manifest.claimable_ids(RETRYABLE, max_attempts=max_attempts)
+        retry_ids = manifest.claimable_ids(
+            RETRYABLE, max_attempts=max_attempts, partition=partition)
 
     stats = manifest.stats()
-    remaining = stats.get(PENDING, 0) + len(retry_ids)
+    # `stats` stays whole-corpus, because that is what the bar measures. What is left *for
+    # this device*, though, is the partitioned count -- using the corpus figure would set
+    # the run's target (and the Pending= readout) too high by a factor of `devices`.
+    pending_here = manifest.count_claimable((PENDING,), partition=partition)
+    if partition:
+        console("device %s — %s paper(s) pending in this slice",
+                describe_partition(partition), f"{pending_here:,}")
+    remaining = pending_here + len(retry_ids)
     todo = min(remaining, limit) if limit else remaining
     if not todo:
-        stuck = manifest.count_claimable(RETRYABLE) - len(retry_ids)
+        stuck = manifest.count_claimable(RETRYABLE, partition=partition) - len(retry_ids)
         log.info("nothing pending; run `prepare` first or use `retry`")
         console("nothing to do — the manifest is empty or complete."
                 + (f" {stuck:,} paper(s) are out of retry attempts; "
@@ -308,7 +433,7 @@ def run_pipeline(
     # start is indistinguishable from a broken one, and a paper held back by the attempt
     # ceiling was previously invisible: the explanation only appeared in the "nothing to
     # do" branch, which never fires while millions of papers are still pending.
-    total_failed = manifest.count_claimable(RETRYABLE)
+    total_failed = manifest.count_claimable(RETRYABLE, partition=partition)
     if not getattr(retry_cfg, "on_start", True):
         if total_failed:
             console("retry: %s failed paper(s) left alone (retry.on_start is off)",
@@ -360,7 +485,7 @@ def run_pipeline(
     # `status`. The bar measures the corpus: converted papers out of papers in scope.
     total_papers = stats.get("total", 0)
     done_at_start = stats.get(DONE, 0)
-    pending_at_start = stats.get(PENDING, 0)
+    pending_at_start = pending_here
     claimed_from_pending = 0        # drives the Pending= readout as rows are claimed
 
     tallies = dict(EMPTY_TALLIES)
@@ -379,6 +504,28 @@ def run_pipeline(
             refresh=False,
         )
     bars = WorkerBars(cfg.convert.workers, enabled=worker_bars)
+
+    # A throttle is a fact about the host, not about a paper, so it pauses every download at
+    # once. Built after the bars because the countdown needs the first free line under them,
+    # and resumed through a hook: the token bucket has to be emptied before the gate reopens
+    # (an idle bucket refills to `burst`, and a burst is how a block is earned), and the main
+    # bar's clock re-based (nothing advances it during the pause, so the next paper would
+    # otherwise be charged the whole wait and the ETA would read in weeks).
+    def _after_cooldown() -> None:
+        limiter.drain()
+        bar.unpause()
+
+    cooldown = Cooldown(
+        stop=stop,
+        seconds=getattr(cfg.crawl, "cooldown_seconds", 3600),
+        max_seconds=getattr(cfg.crawl, "cooldown_max_seconds", 21600),
+        statuses=getattr(cfg.crawl, "cooldown_statuses", None) or (),
+        escalate=getattr(cfg.crawl, "cooldown_escalate", True),
+        max_rounds=getattr(cfg.crawl, "cooldown_max_rounds", 4),
+        position=bars.next_position,
+        on_resume=_after_cooldown,
+    )
+    session.cooldown = cooldown
 
     # Papers that failed and still have tries left, waiting to go round again. They stay
     # `in_flight` in the manifest throughout, because this run has not let go of them.
@@ -429,7 +576,7 @@ def run_pipeline(
             tallies["in_run_retries"] = tallies.get("in_run_retries", 0) + 1
             requeue.append(row)
             console("  ↻ %s failed (%s) — retrying now",
-                    result.arxiv_id, (result.error or result.status)[:90])
+                    result.arxiv_id, (result.error or result.status)[:160])
             return
 
         writer.submit(result)
@@ -490,12 +637,54 @@ def run_pipeline(
             want -= len(claimed)
             fresh_dispatched += len(claimed)
         if want > 0:
-            batch = manifest.claim_batch(want)
+            batch = manifest.claim_batch(want, partition=partition)
             rows += batch
             fresh_dispatched += len(batch)
             # Only these leave the `pending` pool; retries come from the failed statuses.
             claimed_from_pending += len(batch)
+        if claim_any and partition and not rows and want > 0 and not stop.is_set():
+            stolen = _steal(want)
+            rows += stolen
+            fresh_dispatched += len(stolen)
         return rows
+
+    # How many rows `_steal` will look at before giving the dispatch loop its turn back.
+    # Without a bound, a tail where every remaining paper is already in the bucket would
+    # sit in one `_claim` call doing a HEAD per paper for the rest of the queue.
+    STEAL_INSPECT_FACTOR = 10
+
+    def _steal(want: int) -> list[PaperRow]:
+        """Claim outside this device's slice, once the slice itself has drained.
+
+        Each candidate is checked against the bucket first: the other device may well have
+        converted it already, and re-downloading a paper that is stored is precisely the
+        waste the partition exists to prevent. One HEAD per paper is affordable here and
+        nowhere else, because this only ever runs at the tail of a run.
+
+        Two devices stealing at once can still race onto the same paper. The cost is a
+        duplicated download and an idempotent overwrite -- never a corrupt object.
+        """
+        taken: list[PaperRow] = []
+        inspected = 0
+        while len(taken) < want and inspected < want * STEAL_INSPECT_FACTOR:
+            batch = manifest.claim_batch(want - len(taken))
+            if not batch:
+                break                       # nothing left anywhere; the run is finishing
+            for row in batch:
+                inspected += 1
+                if store is not None and store.exists(store.name_for("md", row.arxiv_id)):
+                    # Already converted elsewhere. Record it and move on -- no download,
+                    # no conversion, and not counted as this run's own work.
+                    writer.submit(TaskResult(arxiv_id=row.arxiv_id, status=DONE,
+                                             remote_only=True))
+                    tallies["already_elsewhere"] = tallies.get("already_elsewhere", 0) + 1
+                    bar.update(1)
+                    continue
+                taken.append(row)
+        if taken or tallies.get("already_elsewhere"):
+            log.info("claim-any: took %d paper(s) from outside slice %s", len(taken),
+                     partition)
+        return taken
 
     # Back-pressure, so that running out of memory slows the crawl down instead of
     # handing the kernel's OOM killer a choice of victims. It does not shrink a worker;
@@ -626,10 +815,15 @@ def run_pipeline(
                             count_attempt=True,
                         ), row)
     finally:
-        bars.close()
-        bar.close()
+        # Pools first, bars second. A cooldown parks a download thread inside its own
+        # `tqdm`, and closing the main bar while that bar is still live moves the cursor
+        # under it -- the countdown then redraws in the wrong place and blanks the wrong
+        # line on close. Shutting the pools down first means every bar below position 0
+        # has already closed itself by the time the main bar does.
         dl_pool.shutdown(wait=True)
         cv_pool.shutdown(wait=True)
+        bars.close()
+        bar.close()
         writer.stop()
         if stop.is_set():
             # Interrupted: leave the per-worker files in place so the next run resumes
@@ -645,5 +839,12 @@ def run_pipeline(
         if not keep_pdf:
             for leftover in cfg.paths.tmp_dir.glob("*.pdf*"):
                 leftover.unlink(missing_ok=True)
+
+    if cooldown.rounds_served:
+        tallies["cooldowns"] = cooldown.rounds_served
+    if cooldown.gave_up:
+        # The caller turns this into a non-zero exit, so a restart wrapper waits instead of
+        # relaunching straight back into the block.
+        tallies["throttled_out"] = 1
 
     return tallies
