@@ -26,9 +26,10 @@ from .utils.state import DONE, FAILED_CONVERT, FAILED_DOWNLOAD, NO_PDF, PENDING,
 
 log = logging.getLogger("arxiv_crawler")
 
-# Commands that own the terminal with a progress bar: they log to the file and keep
-# stderr clear. The rest are one-shot reports, so their few lines belong on stderr.
-QUIET_COMMANDS = {"run", "run-minio", "dump", "test-paper", "sync"}
+# Commands that own the terminal, or that print their own report: they log to the file and
+# keep stderr clear, so a warning cannot arrive twice -- once from the logger and once from
+# the `console()` line meant for the user.
+QUIET_COMMANDS = {"run", "run-minio", "dump", "test-paper", "sync", "devices"}
 
 # Sourced from the registry rather than a hand-written list, so a new backend is
 # selectable the moment it is registered.
@@ -250,6 +251,106 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
         print(f"  {line}")
     if args.dry_run:
         print("\n(dry run — the manifest was not changed)")
+    return 0
+
+
+def _age(stamp: str | None) -> str:
+    """How long ago, in words. `?` when the marker did not say."""
+    from datetime import datetime, timezone
+
+    if not stamp:
+        return "?"
+    try:
+        when = datetime.fromisoformat(stamp)
+    except ValueError:
+        return "?"
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    seconds = (datetime.now(timezone.utc) - when).total_seconds()
+    if seconds < 90:
+        return f"{int(seconds)}s ago"
+    if seconds < 5400:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 172800:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
+def cmd_devices(cfg: Config, args: argparse.Namespace) -> int:
+    """What every machine sharing this bucket is doing.
+
+    Read from the per-device markers under `<prefix>/_state/sync/`, which a running crawl
+    republishes every `sync.heartbeat_seconds`. Each row is that device's own view of its own
+    work, written at the time in `last seen` -- so a stale row means a machine that stopped
+    or lost the bucket, not one that finished.
+    """
+    from .utils.objectstore import MinioSettings, MinioStore, ObjectStoreError
+    from .utils.sync import check_partition_agreement, device_name, read_markers
+
+    try:
+        settings = MinioSettings.from_config(cfg.minio)
+        settings.validate()
+        store = MinioStore(settings)
+        markers = read_markers(store)
+    except ObjectStoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:                # noqa: BLE001 - unreachable host, usually
+        log.error("could not read the device markers", exc_info=exc)
+        print(f"error: could not reach the bucket ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+        return 2
+
+    me = device_name(cfg.sync)
+    print(f"\nDevices sharing {store.describe()}\n")
+    if not markers:
+        print("no device markers yet — they appear after the first `sync` or `run-minio`.")
+        print(f"this machine would report as '{me}'.")
+        return 0
+
+    header = (f"{'device':<18}{'slice':>8}{'state':>12}{'done':>10}{'failed':>8}"
+              f"{'papers/min':>12}{'last seen':>12}")
+    print(header)
+    print("-" * len(header))
+    ordered = sorted(markers, key=lambda m: (m.get("device_index", 0) or 0,
+                                             str(m.get("device", ""))))
+    for marker in ordered:
+        run = marker.get("run") or {}
+        name = str(marker.get("device", "?"))[:17]
+        devices = marker.get("devices", 1) or 1
+        index = marker.get("device_index", 0) or 0
+        slice_label = f"{index + 1}/{devices}" if devices > 1 else "all"
+        state = str(run.get("state") or marker.get("state") or "idle")
+        if run.get("paused"):
+            state = "cooldown"
+        mark = " *" if name == me else ""
+        print(f"{name + mark:<18}{slice_label:>8}{state:>12}"
+              f"{run.get('done', 0):>10,}{run.get('failed', 0):>8,}"
+              f"{run.get('papers_per_min', 0):>12}"
+              f"{_age(marker.get('updated_at') or marker.get('synced_at')):>12}")
+    print("-" * len(header))
+
+    for marker in ordered:
+        run = marker.get("run") or {}
+        if not run.get("slice_total"):
+            continue
+        share = run["slice_done"] / run["slice_total"] * 100 if run["slice_total"] else 0
+        print(f"{marker.get('device', '?')}: slice {run['slice_done']:,}"
+              f"/{run['slice_total']:,} ({share:.1f}%)"
+              + (f", corpus {run['corpus_done']:,}/{run['corpus_total']:,}"
+                 if run.get("corpus_total") else "")
+              + (f", last synced {_age(marker.get('synced_at'))}"
+                 if marker.get("synced_at") else ""))
+
+    problems = check_partition_agreement(markers, me, resolve_partition(
+        args.devices, args.device_index, cfg.sync))
+    if problems:
+        print("\nfix the device index before crawling further, then `sync` on both machines.")
+        return 1
+    if len(markers) > 1:
+        print(f"\n* this machine. Each row is that device's own last report, republished "
+              f"every {cfg.sync.heartbeat_seconds}s while it crawls —")
+        print("  so a stale row means a machine that stopped, not one that finished.")
     return 0
 
 
@@ -483,6 +584,13 @@ def build_parser() -> argparse.ArgumentParser:
     sy.add_argument("--force", action="store_true",
                     help="sync even though a run looks like it is in flight")
     sy.set_defaults(func=cmd_sync)
+
+    sdv = sub.add_parser("devices",
+                         help="what every machine sharing the bucket is doing")
+    sdv.add_argument("--devices", type=int, metavar="N",
+                     help="this machine's device count, for the clash check")
+    sdv.add_argument("--device-index", type=int, metavar="I")
+    sdv.set_defaults(func=cmd_devices)
 
     ss = sub.add_parser("status", help="progress report")
     ss.set_defaults(func=cmd_status)

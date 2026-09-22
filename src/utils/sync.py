@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -189,24 +190,33 @@ def marker_name(device: str, *, prefix: str = "") -> str:
 def publish_marker(
     store: MinioStore,
     device: str,
-    report: SyncReport,
+    report: SyncReport | None = None,
     *,
     partition: tuple[int, int] | None = None,
+    run: dict[str, Any] | None = None,
+    state: str = "",
     local_path: Path | None = None,
 ) -> None:
-    """Record this device's sync in the bucket and on disk. Never fatal.
+    """Record this device's sync and progress in the bucket and on disk. Never fatal.
 
-    The bucket copy is what lets each device see when the others last synced, and what the
-    partition cross-check reads. A read-only credential, or a policy that forbids writing
-    under `_state/`, must not abort a twelve-hour crawl over telemetry nothing depends on.
+    The bucket copy is what lets each device see what the others are doing -- it is read by
+    the `devices` command and by the partition cross-check. A read-only credential, or a
+    policy that forbids writing under `_state/`, must not abort a twelve-hour crawl over
+    telemetry nothing depends on, so every failure here is a log line.
     """
-    payload = {
+    payload: dict[str, Any] = {
         "device": device,
-        "synced_at": _utcnow(),
+        "updated_at": _utcnow(),
         "devices": partition[0] if partition else 1,
         "device_index": partition[1] if partition else 0,
-        "report": asdict(report),
     }
+    if report is not None:
+        payload["synced_at"] = _utcnow()
+        payload["sync"] = asdict(report)
+    if run is not None:
+        payload["run"] = {**run, "state": state or run.get("state", "running")}
+    elif state:
+        payload["state"] = state
     body = json.dumps(payload, indent=2, sort_keys=False).encode("utf-8") + b"\n"
     if local_path is not None:
         try:
@@ -235,6 +245,60 @@ def read_markers(store: MinioStore) -> list[dict[str, Any]]:
         except Exception as exc:            # noqa: BLE001 - a torn marker costs nothing
             log.warning("could not read %s: %s", name, exc)
     return markers
+
+
+class Heartbeat(threading.Thread):
+    """Republishes this device's marker while a run is in progress.
+
+    Without it a marker only says what a device was doing at the moment it last synced,
+    which on a twelve-hour crawl is not much. With it, `devices` on any machine shows a view
+    that is at most `interval` seconds stale -- enough to answer "is the other one still
+    going, and how fast".
+
+    A thread rather than a call in the dispatch loop: the loop turns over at 1 Hz and must
+    not be held up by a network write whose timeouts are measured in seconds. Daemon, so it
+    can never keep the process alive, and every publish is already non-fatal.
+    """
+
+    def __init__(
+        self,
+        store: MinioStore,
+        device: str,
+        *,
+        snapshot: Any,
+        interval: float = 60.0,
+        partition: tuple[int, int] | None = None,
+        local_path: Path | None = None,
+    ):
+        super().__init__(name="sync-heartbeat", daemon=True)
+        self.store = store
+        self.device = device
+        # Honoured as given. The floor belongs where the config is read, not here -- a
+        # class that quietly ignores its argument cannot be tested at speed.
+        self.interval = max(float(interval), 0.01)
+        self.partition = partition
+        self.local_path = local_path
+        self._snapshot = snapshot
+        self._quit = threading.Event()
+
+    def _publish(self, state: str) -> None:
+        try:
+            run = self._snapshot()
+        except Exception:                   # noqa: BLE001 - a snapshot must never matter
+            log.exception("could not read the run snapshot")
+            return
+        publish_marker(self.store, self.device, partition=self.partition, run=run,
+                       state=state, local_path=self.local_path)
+
+    def run(self) -> None:
+        while not self._quit.wait(self.interval):
+            self._publish("running")
+
+    def finish(self, state: str = "finished") -> None:
+        """Stop, and publish one last marker saying how the run ended."""
+        self._quit.set()
+        self._publish(state)
+        self.join(timeout=5.0)
 
 
 def _hours_since(stamp: str | None) -> float:
@@ -270,7 +334,8 @@ def check_partition_agreement(
         other = marker.get("device")
         if not other or other == device:
             continue
-        if _hours_since(marker.get("synced_at")) > MARKER_FRESH_HOURS:
+        seen = marker.get("updated_at") or marker.get("synced_at")
+        if _hours_since(seen) > MARKER_FRESH_HOURS:
             continue
         if int(marker.get("devices", 1)) != devices:
             problems.append(
@@ -332,7 +397,7 @@ def run_sync(
 
 
 __all__ = [
-    "ObjectStoreError", "SyncReport", "SyncSettings", "check_partition_agreement",
-    "device_name", "marker_name", "publish_marker", "read_markers", "run_sync",
-    "sync_from_bucket",
+    "Heartbeat", "ObjectStoreError", "SyncReport", "SyncSettings",
+    "check_partition_agreement", "device_name", "marker_name", "publish_marker",
+    "read_markers", "run_sync", "sync_from_bucket",
 ]

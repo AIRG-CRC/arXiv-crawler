@@ -25,6 +25,7 @@ import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -482,9 +483,16 @@ def run_pipeline(
         "rate_per_sec": cfg.crawl.rate_per_sec,
     })
     # Everything the bar reports comes from the manifest, so it can never disagree with
-    # `status`. The bar measures the corpus: converted papers out of papers in scope.
-    total_papers = stats.get("total", 0)
-    done_at_start = stats.get(DONE, 0)
+    # `status`. The bar measures *this device's slice*: converted papers out of the papers
+    # this process can actually reach. With the corpus as the total, a two-device run would
+    # show a denominator twice its reachable maximum, and tqdm would derive an ETA twice as
+    # long as the truth from a rate that is only ever this machine's own. The shared corpus
+    # figure is still reported, in the postfix, where it cannot distort the arithmetic.
+    mine = manifest.stats(partition=partition) if partition else stats
+    total_papers = mine.get("total", 0)
+    done_at_start = mine.get(DONE, 0)
+    corpus_total = stats.get("total", 0)
+    corpus_done_at_start = stats.get(DONE, 0)
     pending_at_start = pending_here
     claimed_from_pending = 0        # drives the Pending= readout as rows are claimed
 
@@ -497,12 +505,16 @@ def run_pipeline(
     )
 
     def _refresh_postfix() -> None:
-        bar.set_postfix_str(
-            f"Fail={tallies['failed']:,}, Done={tallies['done']:,}, "
-            f"Workers={_live_workers()}/{cfg.convert.workers}, "
-            f"Pending={pending_at_start - claimed_from_pending:,}",
-            refresh=False,
-        )
+        readout = (f"Fail={tallies['failed']:,}, Done={tallies['done']:,}, "
+                   f"Workers={_live_workers()}/{cfg.convert.workers}, "
+                   f"Pending={pending_at_start - claimed_from_pending:,}")
+        if partition:
+            # Everything above this describes the slice; this is the shared number. It moves
+            # with our own conversions and is re-based by the next run's sync -- the other
+            # devices' work in between is not visible until then, by design.
+            readout += (f", Corpus={corpus_done_at_start + tallies['done']:,}"
+                        f"/{corpus_total:,}")
+        bar.set_postfix_str(readout, refresh=False)
     bars = WorkerBars(cfg.convert.workers, enabled=worker_bars)
 
     # A throttle is a fact about the host, not about a paper, so it pauses every download at
@@ -698,6 +710,51 @@ def run_pipeline(
         ),
     )
 
+    # Published to the bucket every `sync.heartbeat_seconds` so `devices` on any machine
+    # can see what this one is doing. Read from a thread, so slightly stale counters are
+    # possible and fine -- nothing depends on them but the display.
+    # `started_at` is taken further down by the wedged-conversion tracker, hence the name.
+    run_started = time.monotonic()
+    run_started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def _progress_snapshot() -> dict[str, Any]:
+        elapsed = max(1e-6, time.monotonic() - run_started)
+        return {
+            "started_at": run_started_at,
+            "slice": describe_partition(partition),
+            "devices": partition[0] if partition else 1,
+            "device_index": partition[1] if partition else 0,
+            "slice_done": bar.n,
+            "slice_total": total_papers,
+            "corpus_done": corpus_done_at_start + tallies["done"],
+            "corpus_total": corpus_total,
+            "done": tallies["done"],
+            "failed": tallies["failed"],
+            "no_pdf": tallies["no_pdf"],
+            "retried": tallies["retried"],
+            "pending_in_slice": pending_at_start - claimed_from_pending,
+            "cooldowns": cooldown.rounds_served,
+            "paused": cooldown.paused,
+            "papers_per_min": round(tallies["done"] / elapsed * 60.0, 2),
+            "converter": cfg.convert.converter,
+        }
+
+    heartbeat = None
+    heartbeat_every = float(getattr(getattr(cfg, "sync", None), "heartbeat_seconds", 60) or 0)
+    if store is not None and heartbeat_every > 0:
+        from .sync import Heartbeat, device_name
+
+        heartbeat = Heartbeat(
+            store, device_name(getattr(cfg, "sync", None)),
+            snapshot=_progress_snapshot,
+            # Floored here rather than in the class: a one-second heartbeat is a request
+            # nobody meant to make of a shared bucket.
+            interval=max(heartbeat_every, 5.0),
+            partition=partition,
+            local_path=getattr(cfg.paths, "sync_state", None),
+        )
+        heartbeat.start()
+
     dl_pool = ThreadPoolExecutor(cfg.crawl.workers, thread_name_prefix="dl")
     # `max_tasks_per_child` retires a worker after N papers and starts a fresh one, so
     # whatever the per-paper heap release cannot reclaim cannot accumulate for a whole
@@ -815,6 +872,9 @@ def run_pipeline(
                             count_attempt=True,
                         ), row)
     finally:
+        if heartbeat is not None:
+            heartbeat.finish("interrupted" if stop.is_set() else
+                             "throttled" if cooldown.gave_up else "finished")
         # Pools first, bars second. A cooldown parks a download thread inside its own
         # `tqdm`, and closing the main bar while that bar is still live moves the cursor
         # under it -- the countdown then redraws in the wrong place and blanks the wrong

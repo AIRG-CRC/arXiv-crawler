@@ -127,6 +127,7 @@ sync:
   require_meta: true # a paper counts as done only if md AND meta are in the bucket
   on_start: true # sync automatically at the start of `run-minio`
   marker: true # publish <prefix>/_state/sync/<device>.json after each sync
+  heartbeat_seconds: 60 # how often a running crawl republishes its progress; 0 disables
 
 postgres:
   dsn: null # e.g. "postgresql://user:pass@localhost:5432/arxiv"

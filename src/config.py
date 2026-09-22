@@ -221,6 +221,9 @@ class Sync:
     require_meta: bool = True
     on_start: bool = True          # sync automatically at the start of `run-minio`
     marker: bool = True            # publish <prefix>/_state/sync/<device>.json
+    # How often a running crawl republishes its marker, so `devices` on any machine shows a
+    # live view. One small object per interval; 0 disables, and values below 5s are raised.
+    heartbeat_seconds: int = 60
 
 
 @dataclass

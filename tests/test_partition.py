@@ -369,6 +369,39 @@ def test_claim_any_takes_the_other_slice_but_not_its_finished_papers(tmp_path, m
         assert m.stats()[DONE] == len(ids)               # the corpus is complete either way
 
 
+def test_the_published_marker_describes_this_run(tmp_path, monkeypatch):
+    """The cross-device view is only as good as what gets written into the marker.
+
+    `started_at` in particular: it shared a name with the wedged-conversion tracker, which is
+    declared later in `run_pipeline`, so it silently published `{}` instead of a timestamp.
+    """
+    import json
+
+    from src.utils.sync import marker_name
+
+    ids = [f"2301.{i:05d}" for i in range(20)]
+    converted: list[str] = []
+    cfg, C = _pipeline_cfg(tmp_path, monkeypatch, converted)
+    cfg.sync.device = "dev-a"
+    cfg.sync.heartbeat_seconds = 5
+    client = _with_fake_bucket(monkeypatch)
+    with Manifest(cfg.paths.manifest_db) as m:
+        m.add_papers([PaperRow(arxiv_id=i, version="v1", shard="2301") for i in ids])
+
+    C.run_pipeline(cfg, partition=(2, 0), to_minio=True, sync_bucket=False)
+
+    marker = json.loads(client.objects[marker_name("dev-a", prefix="arxiv")])
+    run = marker["run"]
+    assert marker["device"] == "dev-a"
+    assert (marker["devices"], marker["device_index"]) == (2, 0)
+    assert run["state"] == "finished"
+    assert isinstance(run["started_at"], str) and run["started_at"].startswith("20")
+    assert run["slice_total"] == run["slice_done"] == len(converted)
+    assert run["corpus_total"] == len(ids)          # the corpus is still reported whole
+    assert run["slice_total"] < run["corpus_total"]  # but the slice is this device's share
+    assert run["paused"] is False
+
+
 def test_without_claim_any_a_device_stops_at_its_own_slice(tmp_path, monkeypatch):
     ids = [f"2301.{i:05d}" for i in range(40)]
     converted: list[str] = []

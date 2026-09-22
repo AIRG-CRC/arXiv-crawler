@@ -29,6 +29,7 @@ data/meta/2301/2301.12345.json          title, authors, date, doi, categories, .
 - [Terminal output](#terminal-output)
 - [Object storage](#object-storage)
 - [Running on two devices](#running-on-two-devices)
+- [Watching every machine](#watching-every-machine)
 - [Converter backends](#converter-backends)
 - [Optional: Postgres catalog](#optional-postgres-catalog)
 - [arXiv usage policy](#arxiv-usage-policy)
@@ -312,6 +313,7 @@ paper through the whole path without touching the manifest. See
 [Object storage](#object-storage) and [Running on two devices](#running-on-two-devices).
 
 ```bash
+python -m src.main devices      # what every machine sharing the bucket is doing
 python -m src.main status       # counts by status, output size, tables extracted, last sync
 python -m src.main verify       # cross-check the manifest against files on disk
 python -m src.main checkpoint   # per-worker progress of the current or last run; --clear
@@ -379,6 +381,7 @@ All defaults live in [`config.yaml`](config.yaml); CLI flags override them per f
 | `sync.require_meta` | `true` | A paper counts as done only if *both* its `md` and `meta` objects exist. |
 | `sync.on_start` | `true` | Reconcile with the bucket at the start of every `run-minio`. |
 | `sync.marker` | `true` | Publish `<prefix>/_state/sync/<device>.json` after each sync. |
+| `sync.heartbeat_seconds` | `60` | How often a running crawl republishes its progress, for `devices`. `0` disables; values under 5 are raised. |
 
 Raising `crawl.workers` increases concurrency, **never** the request rate past `rate_per_sec`.
 
@@ -496,6 +499,26 @@ crawl+convert:  38%|███▊      | 18,904/49,141 [2:14:07<3:34:19, 2.35pape
   ✗ 0802.2167  ConversionTimeout: conversion exceeded 120s
 ```
 
+The bar measures **this machine's slice**, not the whole corpus — with `--devices 2` the total is
+half the corpus, so `{remaining}` is derived from a rate and a denominator that belong to the same
+machine. The shared figure rides in the postfix instead:
+
+```
+crawl+convert:  21%|██▏    | 10,472/49,141 [1:02:14<2:19:41, 2.8paper/s,
+                 Fail=3, Done=10,472, Workers=4/4, Pending=38,669, Corpus=20,944/98,282]
+```
+
+| Field | Means |
+|---|---|
+| `n/total` | Converted / reachable **in this machine's slice**. Equals the corpus on a single device. |
+| `Fail`, `Done` | This run's own outcomes, since it started. |
+| `Workers` | Live conversion processes out of `convert.workers`. |
+| `Pending` | Papers still unclaimed **in this slice**. |
+| `Corpus` | Converted / total across every machine, as of the last sync plus this run's own work. Only shown when partitioned. |
+
+`Corpus` does not move when another machine converts something — the bucket is only re-read at the
+start of a run. For a live view of the others, use [`devices`](#watching-every-machine).
+
 Failures are the one exception — the id and its error print above the bar as they happen, written
 through `tqdm.write` so they cannot corrupt it. Everything else is suppressed, including the
 per-paper INFO chatter from `docling` that otherwise runs to four lines per paper in every worker
@@ -602,6 +625,12 @@ device slice 1 of 2 — 1,243,905 paper(s) pending in this slice
 ### Checking it is working
 
 ```bash
+python -m src.main devices
+```
+
+See [Watching every machine](#watching-every-machine). Also useful:
+
+```bash
 python -m src.main status        # "Last bucket sync: ... as device 'mac-studio'"
 python -m src.main sync --dry-run
 ```
@@ -641,6 +670,53 @@ duplicated papers are simply overwritten in place.
   faster.
 - **The device count can change between runs.** Re-slicing only means a given paper is crawled by
   the other device next time, and the sync reconciles it either way.
+
+---
+
+## Watching every machine
+
+A crawl republishes its own progress to `<prefix>/_state/sync/<device>.json` every
+`sync.heartbeat_seconds`, so any machine — or a third one that is only watching — can see the rest:
+
+```bash
+python -m src.main devices
+```
+
+```
+Devices sharing http://10.3.18.40:9000/airg/arxiv
+
+device               slice       state      done  failed  papers/min   last seen
+--------------------------------------------------------------------------------
+mac-studio *           1/2     running    10,472       3         2.8     18s ago
+linux-box              2/2    cooldown     9,918       7         2.6     60s ago
+--------------------------------------------------------------------------------
+mac-studio: slice 10,472/49,141 (21.3%), corpus 20,944/98,282, last synced 3h ago
+linux-box: slice 9,918/49,141 (20.2%), corpus 19,836/98,282, last synced 4h ago
+```
+
+| Column | Means |
+|---|---|
+| `slice` | Which share of the corpus that device is taking. `all` for an unpartitioned run. |
+| `state` | `running`, `finished`, `interrupted` (Ctrl-C), `throttled` (gave up on a block), or `cooldown` — currently waiting out a 406/403. |
+| `done`, `failed` | That device's own outcomes in its current or last run. |
+| `papers/min` | Its conversion rate, averaged over that run. |
+| `last seen` | Age of its marker. Under a minute means it is alive right now. |
+
+**Each row is that device's own last report, not a live reading.** A stale `last seen` on a
+`running` row means a machine that stopped abruptly or lost the bucket — not one that finished. A
+`cooldown` state with a fresh timestamp is the normal, healthy answer to "why has the other machine
+stopped progressing".
+
+`devices` also runs the partition cross-check and **exits 1** if two machines claim the same slice,
+so it works as a pre-flight check:
+
+```bash
+python -m src.main devices && python -m src.main run-minio
+```
+
+It reads the bucket and nothing else — safe to run at any time, from any machine, during a crawl or
+between them. `sync.heartbeat_seconds: 0` switches the publishing off if you would rather not have
+one small object written per minute.
 
 ---
 
@@ -872,7 +948,7 @@ attempts back into the queue:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-259 tests, no network required. The converter suite is skipped unless `pymupdf` is installed and
+263 tests, no network required. The converter suite is skipped unless `pymupdf` is installed and
 one memory test is Linux-only, so a clean macOS checkout reports `249 passed, 2 skipped`. The
 converter tests generate their fixture PDFs at run time, so no binaries are committed; the
 cooldown tests drive a stubbed HTTP response and the sync tests a fake MinIO client, so nothing

@@ -118,6 +118,12 @@ class Cooldown:
         self._next = self._initial
         self._rounds = 0                # consecutive rounds with no clean response since
 
+    @property
+    def paused(self) -> bool:
+        """Is the gate shut right now? Reported in the heartbeat, so another machine can
+        tell "stalled" from "waiting out a block"."""
+        return not self._open.is_set()
+
     # --- what a download thread calls ---------------------------------------------------
     def enter(self) -> int | None:
         """Block while the gate is closed. Returns the generation seen, or None if stopping.

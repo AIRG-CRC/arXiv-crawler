@@ -9,6 +9,7 @@ this manifest at all", because those mean completely different things.
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -259,8 +260,60 @@ def test_marker_round_trips_through_the_bucket(tmp_path):
     assert len(markers) == 1
     assert markers[0]["device"] == "dev-a"
     assert (markers[0]["devices"], markers[0]["device_index"]) == (2, 1)
-    assert json.loads(local.read_text())["report"]["newly_marked"] == 7
+    assert json.loads(local.read_text())["sync"]["newly_marked"] == 7
     assert marker_name("dev-a", prefix="arxiv") == "arxiv/_state/sync/dev-a.json"
+
+
+def test_a_progress_marker_carries_the_run(tmp_path):
+    store, _ = _store()
+    publish_marker(store, "dev-a", partition=(2, 0), state="running",
+                   run={"done": 120, "slice_done": 120, "slice_total": 500,
+                        "papers_per_min": 2.5})
+    marker = read_markers(store)[0]
+    assert marker["run"]["state"] == "running"
+    assert marker["run"]["done"] == 120
+    assert marker["updated_at"]
+    assert "sync" not in marker           # a heartbeat says nothing about the last sync
+
+
+def test_the_heartbeat_publishes_until_it_is_finished(tmp_path):
+    from src.utils.sync import Heartbeat
+
+    store, _ = _store()
+    counter = {"n": 0}
+
+    def snapshot():
+        counter["n"] += 1
+        return {"done": counter["n"]}
+
+    hb = Heartbeat(store, "dev-a", snapshot=snapshot, interval=0.02, partition=(2, 0))
+    hb.start()
+    # Wait for the beats rather than sleeping a fixed time: a `sleep` long enough to be
+    # reliable under load is a slow test, and one short enough to be quick is a flaky one.
+    deadline = time.monotonic() + 5.0
+    while counter["n"] < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert counter["n"] >= 2, "the heartbeat never beat twice"
+
+    hb.finish("interrupted")
+    assert not hb.is_alive()
+    marker = read_markers(store)[0]
+    assert marker["run"]["state"] == "interrupted"
+
+
+def test_a_heartbeat_survives_a_broken_snapshot(tmp_path):
+    from src.utils.sync import Heartbeat
+
+    store, _ = _store()
+
+    def snapshot():
+        raise RuntimeError("counters moved")
+
+    hb = Heartbeat(store, "dev-a", snapshot=snapshot, interval=0.05)
+    hb.start()
+    hb.finish()
+    assert not hb.is_alive()
+    assert read_markers(store) == []       # nothing published, nothing crashed
 
 
 def test_an_unwritable_marker_is_not_fatal(tmp_path):

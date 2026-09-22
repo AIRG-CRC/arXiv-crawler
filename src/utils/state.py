@@ -380,12 +380,24 @@ class Manifest:
 
 
     # Report progress function
-    def stats(self) -> dict[str, int]:
-        cur = self.conn.execute("SELECT status, COUNT(*) AS n FROM papers GROUP BY status")
+    def stats(self, *, partition: tuple[int, int] | None = None) -> dict[str, int]:
+        """Counts by status, for the whole manifest or for one device's slice.
+
+        `partition` is what lets a run measure its own share: with two devices the corpus
+        figure is the shared goal but it is not what this process is working towards, and a
+        progress bar whose total is twice its reachable maximum reports an ETA twice as long
+        as the truth.
+        """
+        where, params = ("", ())
+        if partition:
+            where, params = " WHERE bucket % ? = ?", partition
+        cur = self.conn.execute(
+            f"SELECT status, COUNT(*) AS n FROM papers{where} GROUP BY status", params)
         counts = {r["status"]: r["n"] for r in cur}
         counts["total"] = sum(counts.values())
         counts["low_text"] = self.conn.execute(
-            "SELECT COUNT(*) FROM papers WHERE low_text = 1"
+            f"SELECT COUNT(*) FROM papers WHERE low_text = 1"
+            f"{where.replace(' WHERE ', ' AND ') if where else ''}", params
         ).fetchone()[0]
         return counts
 
