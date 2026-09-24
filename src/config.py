@@ -213,8 +213,13 @@ class Sync:
     device: str | None = None
     # How many machines share this corpus, and which slice this one takes (0-based).
     # null/1 means "this machine does all of it", which is the single-device default.
+    # These are the fallback: when the bucket holds a shared allocation naming this device,
+    # that wins, so the count is changed in one place instead of on every machine.
     devices: int | None = None
     device_index: int | None = None
+    # Follow the shared allocation at <prefix>/_state/partition.json. Turn it off to pin
+    # this machine to its own `devices` / `device_index` regardless of what the bucket says.
+    follow_plan: bool = True
     # Require a meta object as well as an md object before believing a paper is finished.
     # The upload order is md -> tables -> meta, so a device killed between the first and
     # the last leaves an md with no meta, and nobody would ever produce it.

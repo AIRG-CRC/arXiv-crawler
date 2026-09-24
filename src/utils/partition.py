@@ -62,26 +62,45 @@ def resolve_partition(
     devices: int | None = None,
     index: int | None = None,
     cfg: Any = None,
+    *,
+    plan: dict[str, Any] | None = None,
+    device: str = "",
+    follow_plan: bool = True,
 ) -> tuple[int, int] | None:
     """`(devices, index)` for this device, or None for "the whole corpus".
 
-    Three sources, in descending precedence: the CLI flag, the environment, and
-    `sync.devices` / `sync.device_index` in `config.yaml`. A flag therefore overrides a
-    shell profile, which overrides the file -- so a one-off run can always differ from the
-    machine's usual identity without editing anything.
+    Four sources, in descending precedence:
 
-    `None` is returned for a single device, so the claim SQL stays byte-for-byte what it was
-    before partitioning existed.
+    1. an explicit CLI flag, so a one-off run can always differ from everything else;
+    2. the **shared allocation** in the bucket, when it names this device -- this is what
+       makes changing the device count a single edit rather than one per machine, and what
+       stops a machine nobody remembered to update from crawling the wrong slice;
+    3. the environment;
+    4. `sync.devices` / `sync.device_index` in `config.yaml`.
 
-    Note that `config.yaml` is tracked in git. Putting a per-device index there works, but a
-    pull or a checkout can carry one machine's index onto another, at which point both crawl
-    the same slice and nothing crawls the rest. The startup marker cross-check
-    (`sync.check_partition_agreement`) is what catches that.
+    The plan sits above the environment and the config deliberately. If it sat below them, a
+    machine with a stale `devices: 2` in its own config would ignore a corpus that had moved
+    to four, which is the failure the plan exists to remove. `follow_plan=False`
+    (`sync.follow_plan: false`) opts a machine out.
+
+    A plan that exists but does not name this device returns nothing from source 2 and falls
+    through, rather than guessing slice 0 -- guessing would collide with whichever machine
+    genuinely owns slice 0.
     """
+    plan_devices = plan_index = None
+    if follow_plan and plan and device:
+        assigned = plan_partition_of(plan, device)
+        if assigned is not None:
+            plan_devices, plan_index = assigned
+
+    if devices is None:
+        devices = plan_devices
     if devices is None:
         devices = _from_env(DEVICES_ENV)
     if devices is None:
         devices = _as_int(getattr(cfg, "devices", None), "sync.devices")
+    if index is None:
+        index = plan_index
     if index is None:
         index = _from_env(INDEX_ENV)
     if index is None:
@@ -101,6 +120,25 @@ def resolve_partition(
             f"got {index}"
         )
     return None if devices == 1 else (devices, index)
+
+
+def plan_partition_of(plan: dict[str, Any] | None, device: str) -> tuple[int, int] | None:
+    """What the shared allocation gives `device`, or None if it does not name it.
+
+    Duplicated from `sync.plan_partition` on purpose: this module stays free of anything
+    that imports the object store, so the partition logic can be reasoned about -- and
+    tested -- without a bucket anywhere near it.
+    """
+    if not plan:
+        return None
+    try:
+        devices = int(plan.get("devices") or 1)
+        assignments = plan.get("assignments") or {}
+        if device not in assignments:
+            return None
+        return devices, int(assignments[device])
+    except (TypeError, ValueError):
+        return None
 
 
 def describe(partition: tuple[int, int] | None) -> str:

@@ -314,6 +314,8 @@ paper through the whole path without touching the manifest. See
 
 ```bash
 python -m src.main devices      # what every machine sharing the bucket is doing
+python -m src.main devices --set-devices N --auto   # reallocate the whole fleet in one write
+python -m src.main devices --assign NAME=INDEX      # place one machine by hand
 python -m src.main status       # counts by status, output size, tables extracted, last sync
 python -m src.main verify       # cross-check the manifest against files on disk
 python -m src.main checkpoint   # per-worker progress of the current or last run; --clear
@@ -358,7 +360,7 @@ All defaults live in [`config.yaml`](config.yaml); CLI flags override them per f
 | `convert.device` | `auto` | `auto`, `cpu` or `cuda`. Pin it to catch a silent fall back to CPU. |
 | `convert.num_threads` | `null` | CPU threads per worker; `null` derives `cores // workers`. |
 | `convert.pdf_backend` | `pypdfium` | docling's text backend. See the note in `config.yaml`. |
-| `convert.fallback_converter` | `pymupdf` | Tried when the configured backend fails. `null` disables. |
+| `convert.fallback_converter` | `pymupdf` | Tried when the configured backend fails. `null` disables. Set it to `null` on a machine where a silent downgrade is worse than a recorded failure. |
 | `convert.max_tasks_per_child` | `100` | Retire a conversion worker after N papers, bounding heap drift. |
 | `convert.memory_floor` | `0.12` | Pause dispatch below this much free RAM. Fraction, `"4GB"`, or `null`. |
 | `convert.max_pages` | `300` | Longer documents are truncated, not failed. |
@@ -378,12 +380,20 @@ All defaults live in [`config.yaml`](config.yaml); CLI flags override them per f
 | `sync.device` | `null` | This device's name in the bucket; `null` uses the hostname. |
 | `sync.devices` | `null` | How many machines share this corpus. `null` or `1` means just this one. |
 | `sync.device_index` | `null` | Which slice this machine takes, 0-based. See the warning below. |
+| `sync.follow_plan` | `true` | Adopt the shared allocation in the bucket when it names this device, overriding the two keys above. |
 | `sync.require_meta` | `true` | A paper counts as done only if *both* its `md` and `meta` objects exist. |
 | `sync.on_start` | `true` | Reconcile with the bucket at the start of every `run-minio`. |
 | `sync.marker` | `true` | Publish `<prefix>/_state/sync/<device>.json` after each sync. |
 | `sync.heartbeat_seconds` | `60` | How often a running crawl republishes its progress, for `devices`. `0` disables; values under 5 are raised. |
 
 Raising `crawl.workers` increases concurrency, **never** the request rate past `rate_per_sec`.
+
+> **`rate_per_sec` is per machine, not per corpus.** The token bucket lives in one process, so
+> four machines at the default `1.0` put **4 requests/second** on export.arxiv.org — at or past
+> what arXiv asks of automated clients, and a likely way to earn the 406 that the cooldown then
+> waits out. Divide it by the number of devices: `crawl.rate_per_sec: 0.25` on each of four
+> machines keeps the aggregate at roughly 1/s. Nothing enforces this across machines; it is
+> arithmetic you have to do.
 
 **Credentials never go in this file** — it is tracked in git. Export them:
 
@@ -577,6 +587,87 @@ locally — nothing already converted is ever crawled again.
 file, and there are two files. So the queue is split by `crc32(arxiv_id) % 256`, and each device
 claims only its own residue class. No coordination, no leases, no shared database.
 
+### Changing the number of machines
+
+The split is computed per claim — `bucket % devices == index` — so **nothing is stored that
+needs migrating.** Change the count and the next run reallocates by arithmetic. Work already done
+stays done; papers a machine no longer owns simply get claimed by whichever machine now owns them.
+
+The only thing that needs agreeing is the count itself, and that lives in the bucket:
+
+```bash
+python -m src.main devices --set-devices 4 --auto
+```
+
+`--auto` assigns every machine that has reported, plus this one, to a slice in name order, and
+writes `<prefix>/_state/partition.json`. **Every machine adopts it at its next run** — no
+per-machine edits, and a machine you forget about cannot end up on the wrong slice:
+
+```
+allocation written to http://10.3.18.40:9000/airg/arxiv/_state/partition.json
+
+  4 device(s), set by mac-studio at 2026-09-24T03:42:31+00:00
+    slice 1 of 4  CIT
+    slice 2 of 4  linux-box
+    slice 3 of 4  mac-studio
+    slice 4 of 4  thinkpad
+
+every machine picks this up at its next run — no per-machine edits.
+```
+
+Each run then says which slice it took and whether that changed:
+
+```
+allocation: slice 3 of 4, from the shared plan set by mac-studio
+allocation changed since the last run here: slice 1 of 2 → slice 3 of 4
+  (the split is recomputed per claim; nothing needs migrating)
+```
+
+To place a machine by hand, or to add one the plan does not know about:
+
+```bash
+python -m src.main devices --assign thinkpad=3
+```
+
+**To scale down**, name the machine that is leaving. The rest are reindexed contiguously, which
+is what keeps the allocation valid — lowering the count on its own cannot work, because whoever
+held the top slice would be left pointing at a slice that no longer exists:
+
+```bash
+python -m src.main devices --auto --unassign mac-studio
+```
+
+```
+  3 device(s), set by CIT at 2026-09-24T03:48:17+00:00
+    slice 1 of 3  CIT
+    slice 2 of 3  gx10-df62
+    slice 3 of 3  linux-box
+```
+
+A machine already running keeps the split it started with, so **stop the machine you removed** —
+and stop or restart the others when convenient. Nothing is lost if you don't: the three remaining
+slices still cover the whole corpus, so no paper is stranded.
+
+**One rule makes the rest predictable:** a machine that follows a plan which splits the corpus
+must be named in it. A machine you dropped and then restarted refuses rather than re-crawling a
+slice the others already cover — silent duplication for hours is much worse than an error you fix
+in one command. `sync.follow_plan: false` is the deliberate way out.
+
+The plan **overrides** `sync.devices` / `sync.device_index` and the environment, because a machine
+with a stale local count is exactly what it exists to prevent. A `--devices` flag still wins, for a
+one-off run, and `sync.follow_plan: false` pins a machine to its own settings. A machine the plan
+splits away from but never names **refuses to start** rather than defaulting to slice 0 and
+silently duplicating whoever owns it.
+
+`devices` tells a rollout apart from a fault. A machine that is stopped and will adopt the new
+split gets a `·` notice; one that is *crawling the wrong slice right now* gets a `⚠` and exit 1:
+
+```
+  · 'mac-studio' last ran on slice 1 of 2; it will pick up slice 3 of 3 when it next starts
+  ⚠ 'linux-box' is crawling slice 2 of 2 right now, but the allocation puts it on slice 2 of 3
+    — it is on the wrong slice until it restarts
+```
+
 ### Setting it up
 
 `prepare` on both devices with the **same scope** — the split is over the manifest, so different
@@ -668,8 +759,17 @@ duplicated papers are simply overwritten in place.
   to `9901` which sorts *after* every modern `2xxx` shard, and `misc` sorts after all of them. The
   scan skips whole shards that are already complete instead, which is both sound and usually
   faster.
-- **The device count can change between runs.** Re-slicing only means a given paper is crawled by
-  the other device next time, and the sync reconciles it either way.
+- **The device count can change between runs**, in one write — see
+  [Changing the number of machines](#changing-the-number-of-machines). Re-slicing only means a
+  given paper is crawled by a different machine next time, and the sync reconciles it either way.
+  A machine already running keeps the split it started with until it restarts.
+- **Divide `crawl.rate_per_sec` by the number of machines.** The rate limiter is per process, so
+  N machines at the default make N requests a second against arXiv. See
+  [Configuration](#configuration).
+- **Check the converter on a new machine before starting a long run.** A fresh install may not be
+  able to fetch its models, and every paper then silently takes the fallback — which keeps far
+  fewer tables, so that machine contributes worse output to the shared bucket than the others.
+  `test-paper <id> --converter docling` takes a few seconds and answers it.
 
 ---
 
@@ -875,6 +975,22 @@ figure-heavy one).
 **Interrupting is safe.** `Ctrl-C` once: in-flight work finishes, staged PDFs are cleaned up, and
 rows left `in_flight` are returned to `pending` on the next start. Just run `run` again.
 
+**Is the converter actually working on this machine?** Worth two seconds before a run measured
+in days, especially on a new machine or after a driver update:
+
+```bash
+python -c "import torch, torch.nn as nn; print(torch.__version__, torch.version.cuda, torch.backends.cudnn.version(), torch.cuda.is_available()); print(nn.Conv2d(3,8,3).cuda()(torch.randn(1,3,64,64,device='cuda')).shape)"
+```
+
+A cuDNN or CUDA fault shows up here immediately, with no models to download and no papers to
+fetch. If it fails, `convert.device: cpu` makes docling work rather than fail — and since the
+crawl is capped by `rate_per_sec` rather than by conversion, that is often fast enough to keep up.
+Then confirm end to end on one paper:
+
+```bash
+python -m src.main test-paper 2102.12018 --converter docling
+```
+
 **Something failed.** The next `run` retries it automatically ([Retries](#retries)). `status` shows
 the breakdown, and the manifest keeps a per-paper `error`. To force papers that are out of
 attempts back into the queue:
@@ -899,6 +1015,12 @@ attempts back into the queue:
 
 | Symptom | Cause and fix |
 |---|---|
+| `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` | docling reached the GPU but PyTorch cannot load a cuDNN sublibrary — a broken or mismatched CUDA install, not a problem with the paper. Reproduce it in two seconds with the conv2d check below; then either fix the install or set `convert.device: cpu` on that machine. |
+| Everything `converted by fallback` | The configured converter is broken on this machine, not defeated by the papers. The run says so once after 10 consecutive fallbacks and again in the summary. For docling, a `RepositoryNotFoundError: 401` means an HF token in the environment is being sent and rejected — the model repo is public, so `unset HF_TOKEN HUGGING_FACE_HUB_TOKEN` and verify with `test-paper <id> --converter docling` before restarting. |
+| `⚠ device 'X' last ran with --devices N` | Nobody has set a shared allocation, so each machine is using its own count and they disagree. `devices --set-devices N --auto` fixes it in one write. |
+| `· 'X' last ran on slice … it will pick up …` | Not a problem — a stopped machine that will adopt the new allocation when it restarts. Only the `⚠` lines need action. |
+| `the shared allocation … does not name this device` | Either this machine should be in the allocation (`devices --assign <name>=<n>`, or `devices --auto`), or it was deliberately removed and should be stopped. It refuses to fall back to its own config because that would duplicate whoever now owns that share. |
+| `… is assigned a slice that does not exist` | You lowered the count without saying which machine is leaving. `devices --auto --unassign <name>` drops one and reindexes the rest. |
 | `HTTP 406` or `403`, many papers at once | arXiv is refusing this IP, not rejecting the papers. Handled automatically — see [When arXiv throttles you](#when-arxiv-throttles-you). If it keeps happening, lower `--rps`. |
 | The run exited 75 | It waited out the full cooldown ladder and arXiv never relented. Wait a few hours. Do not auto-restart on 75. |
 | Many `failed_download`, `HTTP 429` | Rate limited. Lower `--rps`, wait, retry. |
@@ -948,7 +1070,7 @@ attempts back into the queue:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-263 tests, no network required. The converter suite is skipped unless `pymupdf` is installed and
+292 tests, no network required. The converter suite is skipped unless `pymupdf` is installed and
 one memory test is Linux-only, so a clean macOS checkout reports `249 passed, 2 skipped`. The
 converter tests generate their fixture PDFs at run time, so no binaries are committed; the
 cooldown tests drive a stubbed HTTP response and the sync tests a fake MinIO client, so nothing

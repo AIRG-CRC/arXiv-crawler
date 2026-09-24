@@ -355,3 +355,147 @@ def test_a_stale_marker_is_not_evidence_of_anything():
 def test_this_device_does_not_clash_with_itself():
     assert not check_partition_agreement(
         [_marker("dev-a", 2, 0)], "dev-a", (2, 0), announce=lambda *a: None)
+
+
+# --- the shared allocation ---------------------------------------------------------------
+def test_a_plan_round_trips_and_validates():
+    from src.utils.sync import plan_name, plan_partition, read_plan, write_plan
+
+    store, _ = _store()
+    assert read_plan(store) is None                  # absent is not an error
+
+    plan = write_plan(store, 4, {"a": 0, "b": 1, "c": 2}, by="a")
+    assert plan["devices"] == 4
+    assert read_plan(store) == plan
+    assert plan_name("arxiv") == "arxiv/_state/partition.json"
+    assert plan_partition(plan, "b") == (4, 1)
+    assert plan_partition(plan, "unknown") is None   # never guesses a slice
+    assert plan_partition(None, "b") is None
+
+
+@pytest.mark.parametrize("devices,assignments,fragment", [
+    (0, {}, "at least 1"),
+    (2, {"a": 5}, "does not exist"),
+    (2, {"a": 0, "b": 0}, "both assigned"),
+])
+def test_an_impossible_plan_is_refused(devices, assignments, fragment):
+    from src.utils.sync import write_plan
+
+    store, _ = _store()
+    with pytest.raises(ValueError, match=fragment):
+        write_plan(store, devices, assignments)
+
+
+def test_unparseable_plans_are_ignored_not_fatal():
+    from src.utils.sync import plan_name, read_plan
+
+    store, client = _store()
+    client.objects[plan_name("arxiv")] = b"{not json"
+    assert read_plan(store) is None
+    client.objects[plan_name("arxiv")] = b'{"assignments": {"a": 0}}'
+    assert read_plan(store) is None                  # no device count, so no plan
+
+
+def test_changing_the_count_reallocates_every_device():
+    """The point of the feature: one write moves the whole fleet."""
+    from src.utils.sync import plan_partition, write_plan
+
+    store, _ = _store()
+    names = ["mac-studio", "linux-box", "CIT"]
+
+    two = write_plan(store, 2, {"mac-studio": 0, "linux-box": 1})
+    assert plan_partition(two, "mac-studio") == (2, 0)
+    assert plan_partition(two, "CIT") is None
+
+    three = write_plan(store, 3, {name: i for i, name in enumerate(names)})
+    assert [plan_partition(three, n) for n in names] == [(3, 0), (3, 1), (3, 2)]
+    # and the slices still cover everything, which is the property that matters
+    from src.utils.partition import bucket_for
+
+    owners = {n: {p for p in (f"2301.{i:05d}" for i in range(300))
+                  if bucket_for(p) % 3 == plan_partition(three, n)[1]} for n in names}
+    union = set().union(*owners.values())
+    assert len(union) == 300
+    assert sum(len(v) for v in owners.values()) == 300      # no overlap
+
+
+def _marker(device, devices, index, *, hours_ago=0.0, state="finished"):
+    when = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return {"device": device, "devices": devices, "device_index": index,
+            "updated_at": when.isoformat(timespec="seconds"),
+            "run": {"state": state}}
+
+
+def test_a_machine_yet_to_restart_is_a_notice_not_a_problem():
+    """Immediately after the count changes, every other marker disagrees. That is a
+    rollout, and calling it a fault is what made the warning confusing."""
+    plan = {"devices": 3, "assignments": {"a": 0, "b": 1, "c": 2}}
+    said: list[str] = []
+    problems = check_partition_agreement(
+        [_marker("b", 2, 1, state="finished")], "a", (3, 0), plan=plan,
+        announce=lambda msg, *args: said.append(msg % args))
+    assert problems == []
+    assert any("will pick up slice 2 of 3" in line for line in said)
+    assert said[0].strip().startswith("·")
+
+
+def test_a_machine_running_on_the_old_split_is_a_problem():
+    plan = {"devices": 3, "assignments": {"a": 0, "b": 1, "c": 2}}
+    problems = check_partition_agreement(
+        [_marker("b", 2, 1, state="running")], "a", (3, 0), plan=plan,
+        announce=lambda *a: None)
+    assert len(problems) == 1
+    assert "right now" in problems[0]
+
+
+def test_an_unassigned_slice_is_a_problem():
+    plan = {"devices": 4, "assignments": {"a": 0, "b": 1}}
+    problems = check_partition_agreement([], "a", (4, 0), plan=plan, announce=lambda *a: None)
+    assert len(problems) == 1
+    assert "will not be crawled by anyone" in problems[0]
+
+
+def test_a_device_outside_the_plan_is_flagged():
+    plan = {"devices": 2, "assignments": {"a": 0, "b": 1}}
+    said: list[str] = []
+    check_partition_agreement([_marker("stray", 1, 0)], "a", (2, 0), plan=plan,
+                              announce=lambda msg, *args: said.append(msg % args))
+    assert any("not in the allocation" in line for line in said)
+
+
+def test_without_a_plan_the_pairwise_check_still_applies():
+    problems = check_partition_agreement(
+        [_marker("b", 2, 0)], "a", (2, 0), announce=lambda *a: None)
+    assert len(problems) == 1 and "device-index 0" in problems[0]
+
+
+def test_scaling_down_reindexes_contiguously():
+    """Dropping a machine must leave a valid allocation, not a hole where it was.
+
+    Lowering the count alone cannot work: whoever held the top slice is left pointing at a
+    slice that no longer exists, which `write_plan` refuses. Reindexing is what makes
+    scaling down expressible at all.
+    """
+    from src.utils.sync import plan_partition, write_plan
+
+    store, _ = _store()
+    fleet = ["CIT", "gx10-df62", "linux-box", "mac-studio"]
+    write_plan(store, 4, {name: i for i, name in enumerate(fleet)})
+
+    # the naive lowering is refused, and for the right reason
+    with pytest.raises(ValueError, match="does not exist"):
+        write_plan(store, 3, {name: i for i, name in enumerate(fleet)})
+
+    remaining = [n for n in fleet if n != "mac-studio"]
+    three = write_plan(store, 3, {name: i for i, name in enumerate(remaining)})
+    assert [plan_partition(three, n) for n in remaining] == [(3, 0), (3, 1), (3, 2)]
+    assert plan_partition(three, "mac-studio") is None
+
+
+def test_the_three_remaining_slices_still_cover_the_corpus():
+    from src.utils.partition import bucket_for
+
+    papers = [f"2301.{i:05d}" for i in range(600)]
+    owners = [{p for p in papers if bucket_for(p) % 3 == i} for i in range(3)]
+    assert set().union(*owners) == set(papers)
+    assert sum(len(o) for o in owners) == len(papers)      # disjoint

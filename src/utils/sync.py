@@ -44,6 +44,12 @@ log = logging.getLogger(__name__)
 
 DEVICE_ENV = "ARXIV_CRAWLER_DEVICE"
 MARKER_PREFIX = "_state/sync"
+# The authoritative split, written once and read by every machine. Without it each device
+# decides its own device count from its own config, so changing the count means editing every
+# machine and any one you forget silently crawls the wrong slice -- or the same slice as
+# somebody else. One object removes that whole class of mistake: change it here, and every
+# run picks the new allocation up at its next start.
+PLAN_OBJECT = "_state/partition.json"
 # A marker older than this says nothing about what another device is doing right now, so it
 # is not evidence of a partition clash.
 MARKER_FRESH_HOURS = 24
@@ -173,6 +179,98 @@ def sync_from_bucket(
 
     report.duration_s = time.monotonic() - started
     return report
+
+
+# --- the shared allocation ---------------------------------------------------------------
+def plan_name(prefix: str = "") -> str:
+    parts = [p for p in (prefix.strip("/"), PLAN_OBJECT) if p]
+    return "/".join(parts)
+
+
+def read_plan(store: MinioStore) -> dict[str, Any] | None:
+    """The shared allocation, or None if there is not one. Never fatal.
+
+    A bucket that cannot be read must not stop a crawl, so a failure here means "no plan"
+    and the machine falls back to its own configuration.
+    """
+    try:
+        raw = store.get_bytes(plan_name(store.settings.prefix))
+    except Exception as exc:                # noqa: BLE001 - absent is the common case
+        log.debug("no shared partition plan: %s", exc)
+        return None
+    try:
+        plan = json.loads(raw)
+    except ValueError as exc:
+        log.warning("the shared partition plan is not valid JSON: %s", exc)
+        return None
+    if not isinstance(plan, dict) or not plan.get("devices"):
+        log.warning("the shared partition plan has no device count; ignoring it")
+        return None
+    return plan
+
+
+def write_plan(
+    store: MinioStore,
+    devices: int,
+    assignments: dict[str, int],
+    *,
+    by: str = "",
+) -> dict[str, Any]:
+    """Publish the allocation. Raises on failure -- this one is deliberate, so it must not
+    fail quietly the way telemetry may."""
+    if devices < 1:
+        raise ValueError(f"device count must be at least 1, got {devices}")
+    for name, index in sorted(assignments.items()):
+        if not 0 <= index < devices:
+            raise ValueError(
+                f"'{name}' is assigned slice {index}, which does not exist in a "
+                f"{devices}-device split (valid: 0-{devices - 1})")
+    taken: dict[int, str] = {}
+    for name, index in sorted(assignments.items()):
+        if index in taken:
+            raise ValueError(f"'{name}' and '{taken[index]}' are both assigned slice {index}")
+        taken[index] = name
+
+    plan = {
+        "devices": int(devices),
+        "assignments": {k: int(v) for k, v in sorted(assignments.items())},
+        "updated_at": _utcnow(),
+        "updated_by": by or device_name(None),
+    }
+    body = json.dumps(plan, indent=2, sort_keys=False).encode("utf-8") + b"\n"
+    store.put_bytes(plan_name(store.settings.prefix), body,
+                    content_type="application/json")
+    return plan
+
+
+def plan_partition(plan: dict[str, Any] | None, device: str) -> tuple[int, int] | None:
+    """`(devices, index)` this plan gives `device`, or None if it does not name it.
+
+    Returning None rather than guessing is the point: an unassigned device that silently
+    defaulted to slice 0 would collide with whichever machine really owns slice 0, which is
+    the exact failure the plan exists to prevent.
+    """
+    if not plan:
+        return None
+    devices = int(plan.get("devices") or 1)
+    assignments = plan.get("assignments") or {}
+    if device not in assignments:
+        return None
+    return (devices, int(assignments[device]))
+
+
+def describe_plan(plan: dict[str, Any] | None) -> list[str]:
+    if not plan:
+        return ["no shared allocation — each machine uses its own configuration"]
+    lines = [f"{plan['devices']} device(s), set by "
+             f"{plan.get('updated_by', '?')} at {plan.get('updated_at', '?')}"]
+    assignments = plan.get("assignments") or {}
+    for name, index in sorted(assignments.items(), key=lambda kv: (kv[1], kv[0])):
+        lines.append(f"  slice {index + 1} of {plan['devices']}  {name}")
+    unassigned = plan["devices"] - len(assignments)
+    if unassigned > 0:
+        lines.append(f"  {unassigned} slice(s) not assigned to any device yet")
+    return lines
 
 
 # --- device markers ---------------------------------------------------------------------
@@ -318,33 +416,84 @@ def check_partition_agreement(
     device: str,
     partition: tuple[int, int] | None,
     *,
+    plan: dict[str, Any] | None = None,
     announce: Any = console,
 ) -> list[str]:
-    """Warn when another device's recent marker disagrees about the split.
+    """Warn when the fleet does not actually cover the corpus.
 
-    Two devices that both take index 0 crawl the same half of the corpus and neither ever
-    touches the other half -- silently, and for as long as nobody checks. It is the one
-    misconfiguration of this feature that costs real work, and a handful of tiny objects is
-    a cheap way to catch it. Warn only: a stale marker must never stop a crawl.
+    Two devices on the same slice crawl the same papers and nothing crawls the rest --
+    silently, and for as long as nobody checks. It is the one misconfiguration here that
+    costs real work, and a handful of tiny objects is a cheap way to catch it.
+
+    With a shared allocation the comparison is against the plan, which lets a rollout be
+    told apart from a fault. A marker records the device count of that machine's *last run*,
+    so immediately after the count changes every other machine's marker disagrees -- that is
+    a machine yet to restart, not a machine doing the wrong thing, and it is reported as a
+    notice. A machine whose marker says it is **running right now** on the wrong slice is
+    the real problem, and only that is returned as one.
+
+    Warns; never blocks. A stale marker must not stop a crawl.
     """
-    devices = partition[0] if partition else 1
-    index = partition[1] if partition else 0
     problems: list[str] = []
-    for marker in markers:
-        other = marker.get("device")
-        if not other or other == device:
-            continue
+    notices: list[str] = []
+
+    def _fresh(marker: dict[str, Any]) -> bool:
         seen = marker.get("updated_at") or marker.get("synced_at")
-        if _hours_since(seen) > MARKER_FRESH_HOURS:
-            continue
-        if int(marker.get("devices", 1)) != devices:
+        return _hours_since(seen) <= MARKER_FRESH_HOURS
+
+    def _running(marker: dict[str, Any]) -> bool:
+        return (marker.get("run") or {}).get("state") == "running" and _fresh(marker)
+
+    if plan:
+        devices = int(plan.get("devices") or 1)
+        assignments = plan.get("assignments") or {}
+        for marker in markers:
+            other = marker.get("device")
+            if not other:
+                continue
+            ran = (int(marker.get("devices", 1) or 1), int(marker.get("device_index", 0) or 0))
+            expected = assignments.get(other)
+            if expected is None:
+                notices.append(
+                    f"'{other}' is not in the allocation, so it follows its own config — "
+                    f"`devices --assign {other}=<n>` to bring it in")
+                continue
+            if ran != (devices, int(expected)):
+                where = (f"slice {ran[1] + 1} of {ran[0]}",
+                         f"slice {int(expected) + 1} of {devices}")
+                if _running(marker):
+                    problems.append(
+                        f"'{other}' is crawling {where[0]} right now, but the allocation "
+                        f"puts it on {where[1]} — it is on the wrong slice until it restarts")
+                else:
+                    notices.append(
+                        f"'{other}' last ran on {where[0]}; it will pick up {where[1]} "
+                        f"when it next starts")
+        unassigned = devices - len(assignments)
+        if unassigned > 0:
             problems.append(
-                f"device '{other}' last ran with --devices {marker.get('devices')}, "
-                f"this one has {devices}: the slices do not cover the corpus")
-        elif int(marker.get("device_index", 0)) == index:
-            problems.append(
-                f"device '{other}' is also using --device-index {index}: both devices will "
-                f"crawl the same slice and nothing will crawl the others")
+                f"{unassigned} of {devices} slice(s) are assigned to no device, so that "
+                f"share of the corpus will not be crawled by anyone")
+    else:
+        devices = partition[0] if partition else 1
+        index = partition[1] if partition else 0
+        for marker in markers:
+            other = marker.get("device")
+            if not other or other == device or not _fresh(marker):
+                continue
+            if int(marker.get("devices", 1) or 1) != devices:
+                problems.append(
+                    f"'{other}' last ran with --devices {marker.get('devices')}, this one "
+                    f"has {devices}: the slices do not cover the corpus. Set one shared "
+                    f"allocation instead — `devices --set-devices N --auto`")
+            elif int(marker.get("device_index", 0) or 0) == index:
+                problems.append(
+                    f"'{other}' is also using --device-index {index}: both devices will "
+                    f"crawl the same slice and nothing will crawl the others")
+
+    for notice in notices:
+        announce("  · %s", notice)
+        log.info("%s", notice)
     for problem in problems:
         announce("  ⚠ %s", problem)
         log.warning("%s", problem)
@@ -389,7 +538,7 @@ def run_sync(
     )
     if settings.marker:
         check_partition_agreement(read_markers(store), settings.device, partition,
-                                  announce=announce)
+                                  plan=read_plan(store), announce=announce)
         if not dry_run:
             publish_marker(store, settings.device, report, partition=partition,
                            local_path=getattr(cfg.paths, "sync_state", None))
@@ -398,6 +547,7 @@ def run_sync(
 
 __all__ = [
     "Heartbeat", "ObjectStoreError", "SyncReport", "SyncSettings",
-    "check_partition_agreement", "device_name", "marker_name", "publish_marker",
-    "read_markers", "run_sync", "sync_from_bucket",
+    "check_partition_agreement", "describe_plan", "device_name", "marker_name",
+    "plan_name", "plan_partition", "publish_marker", "read_markers", "read_plan",
+    "run_sync", "sync_from_bucket", "write_plan",
 ]

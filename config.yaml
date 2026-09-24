@@ -124,6 +124,12 @@ sync:
   device: null # this machine's name in the bucket; null falls back to the hostname
   devices: null # how many machines share this corpus; null or 1 means just this one
   device_index: null # which slice this machine takes, 0-based, up to devices - 1
+  # The bucket can hold the authoritative split at <prefix>/_state/partition.json, so the
+  # device count is changed once for the whole fleet rather than on every machine:
+  #   python -m src.main devices --set-devices 4 --auto
+  # When that plan names this device it overrides `devices`/`device_index` above. Set this
+  # to false to pin this machine to its own values whatever the plan says.
+  follow_plan: true
   require_meta: true # a paper counts as done only if md AND meta are in the bucket
   on_start: true # sync automatically at the start of `run-minio`
   marker: true # publish <prefix>/_state/sync/<device>.json after each sync

@@ -434,3 +434,139 @@ def test_the_start_of_run_sync_marks_papers_the_other_device_finished(tmp_path, 
     assert set(converted) == set(ids) - set(already)
     with Manifest(cfg.paths.manifest_db) as m:
         assert m.stats()[DONE] == len(ids)
+
+
+# --- the shared allocation drives the split ----------------------------------------------
+def test_the_plan_overrides_a_stale_local_config(monkeypatch):
+    """The whole point: a machine nobody remembered to edit still crawls the right slice."""
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+
+    class Cfg:                                   # left over from when there were two
+        devices = 2
+        device_index = 1
+
+    plan = {"devices": 4, "assignments": {"CIT": 2, "mac-studio": 0}}
+    assert resolve_partition(cfg=Cfg(), plan=plan, device="CIT") == (4, 2)
+    assert resolve_partition(cfg=Cfg(), plan=plan, device="mac-studio") == (4, 0)
+
+
+def test_a_flag_still_beats_the_plan(monkeypatch):
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+    plan = {"devices": 4, "assignments": {"CIT": 2}}
+    assert resolve_partition(8, 7, plan=plan, device="CIT") == (8, 7)
+
+
+def test_a_machine_the_plan_ignores_falls_back_to_its_own_settings(monkeypatch):
+    monkeypatch.setenv(DEVICES_ENV, "2")
+    monkeypatch.setenv(INDEX_ENV, "1")
+    plan = {"devices": 4, "assignments": {"other": 0}}
+    assert resolve_partition(plan=plan, device="CIT") == (2, 1)
+
+
+def test_follow_plan_false_pins_a_machine_to_its_config(monkeypatch):
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+
+    class Cfg:
+        devices = 2
+        device_index = 1
+
+    plan = {"devices": 4, "assignments": {"CIT": 2}}
+    assert resolve_partition(cfg=Cfg(), plan=plan, device="CIT",
+                             follow_plan=False) == (2, 1)
+
+
+def test_a_malformed_plan_is_ignored_rather_than_raising(monkeypatch):
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+    for plan in ({"devices": "four", "assignments": {"CIT": 0}},
+                 {"assignments": {"CIT": 0}},
+                 {"devices": 4, "assignments": {"CIT": "two"}}):
+        assert resolve_partition(plan=plan, device="CIT") is None
+
+
+def test_the_run_reports_a_changed_allocation(tmp_path, monkeypatch, capsys):
+    """A halved slice looks like lost work unless the run says what happened."""
+    import json
+
+    from src.utils import crawler as C
+
+    converted: list[str] = []
+    cfg, _C = _pipeline_cfg(tmp_path, monkeypatch, converted)
+    said: list[str] = []
+    monkeypatch.setattr(C, "console", lambda msg, *a: said.append(msg % a if a else msg))
+
+    # this device last ran as 1 of 2
+    cfg.paths.sync_state.write_text(json.dumps({"devices": 2, "device_index": 0}))
+    with Manifest(cfg.paths.manifest_db) as m:
+        m.add_papers([PaperRow(arxiv_id=f"2301.{i:05d}", version="v1", shard="2301")
+                      for i in range(40)])
+
+    C.run_pipeline(cfg, partition=(4, 0))
+
+    changed = [line for line in said if "allocation changed" in line]
+    assert len(changed) == 1
+    assert "slice 1 of 2" in changed[0] and "slice 1 of 4" in changed[0]
+
+
+def test_an_unchanged_allocation_says_nothing(tmp_path, monkeypatch):
+    import json
+
+    from src.utils import crawler as C
+
+    converted: list[str] = []
+    cfg, _C = _pipeline_cfg(tmp_path, monkeypatch, converted)
+    said: list[str] = []
+    monkeypatch.setattr(C, "console", lambda msg, *a: said.append(msg % a if a else msg))
+
+    cfg.paths.sync_state.write_text(json.dumps({"devices": 4, "device_index": 0}))
+    with Manifest(cfg.paths.manifest_db) as m:
+        m.add_papers([PaperRow(arxiv_id=f"2301.{i:05d}", version="v1", shard="2301")
+                      for i in range(40)])
+
+    C.run_pipeline(cfg, partition=(4, 0))
+    assert not [line for line in said if "allocation changed" in line]
+
+
+def test_a_dropped_machine_refuses_rather_than_duplicating(monkeypatch, tmp_path):
+    """A supervisor restarting a machine that was removed from the allocation must not
+    quietly re-crawl a slice the remaining machines already cover."""
+    import argparse
+
+    from src.config import Config, Paths
+    from src.utils import objectstore as O
+    from src.utils.sync import write_plan
+    from tests.test_objectstore import FakeClient
+    from src import main as M
+
+    monkeypatch.setenv("MINIO_ACCESS_KEY", "k")
+    monkeypatch.setenv("MINIO_SECRET_KEY", "s")
+    monkeypatch.delenv(DEVICES_ENV, raising=False)
+    monkeypatch.delenv(INDEX_ENV, raising=False)
+
+    real = O.MinioStore
+    client = FakeClient()
+    monkeypatch.setattr(O, "MinioStore", lambda s, **kw: real(s, client=client))
+    store = real(O.MinioSettings.from_config(Config().minio), client=client)
+    write_plan(store, 3, {"a": 0, "b": 1, "c": 2}, by="a")
+
+    cfg = Config()
+    cfg.paths = Paths(data_dir=tmp_path)
+    cfg.sync.device = "dropped"
+    cfg.sync.devices = 4                      # its own stale config
+    cfg.sync.device_index = 3
+    args = argparse.Namespace(devices=None, device_index=None)
+
+    with pytest.raises(ValueError, match="does not name this device"):
+        M._resolve_slice(cfg, args)
+
+    # opting out is the deliberate escape, and it works
+    cfg.sync.follow_plan = False
+    assert M._resolve_slice(cfg, args) == (4, 3)
+
+    # a machine the plan names is unaffected
+    cfg.sync.follow_plan = True
+    cfg.sync.device = "b"
+    assert M._resolve_slice(cfg, args) == (3, 1)

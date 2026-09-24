@@ -1011,6 +1011,28 @@ def describe_exception(exc: BaseException, *, limit: int = 4) -> str:
     return " <- caused by ".join(parts)
 
 
+def join_backend_errors(errors: list[str], limit: int = 500) -> str:
+    """Every backend that was tried, within `limit` characters.
+
+    Joining first and clipping afterwards drops the *last* backend's error entirely whenever
+    the first one is verbose -- and a docling CUDA failure repeats the same cuDNN line four
+    times, comfortably past 500 characters on its own. The result read as though docling were
+    the only backend attempted, so "did the fallback have a chance?" -- the one question that
+    decides whether the paper is recoverable -- was unanswerable from the record.
+
+    So the space is budgeted per backend instead, and newlines are collapsed: this string
+    reaches a progress bar and a one-line-per-row report.
+    """
+    flat = [" ".join(e.split()) for e in errors if e and e.strip()]
+    if not flat:
+        return ""
+    joiner = " | then "
+    budget = max(60, (limit - len(joiner) * (len(flat) - 1)) // len(flat))
+    return joiner.join(
+        e if len(e) <= budget else e[: budget - 3] + "..." for e in flat
+    )[:limit]
+
+
 def _converter_chain(convert_cfg: Any) -> list[tuple[str, bool]]:
     """The backends to try, in order, each flagged with whether it is the last chance.
 
@@ -1140,7 +1162,7 @@ def convert_and_write(
                 if is_last:
                     return TaskResult(
                         arxiv_id=row.arxiv_id, status=FAILED_CONVERT,
-                        error=" | then ".join(errors)[:500],
+                        error=join_backend_errors(errors),
                         pdf_bytes=pdf_bytes, pdf_sha256=pdf_sha256,
                         count_attempt=True, worker_id=worker_id,
                     )

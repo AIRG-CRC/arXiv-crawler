@@ -16,6 +16,7 @@ around bursts of 4 req/s, and use export.arxiv.org rather than arxiv.org.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import random
@@ -57,6 +58,13 @@ log = logging.getLogger(__name__)
 
 PDF_MAGIC = b"%PDF-"
 RETRY_STATUS = {429, 500, 502, 503, 504}
+# Consecutive fallbacks before the run says the configured converter is simply broken. A
+# handful is normal -- some PDFs defeat docling and pymupdf picks them up. Ten in a row is
+# not a property of the papers, it is a property of the install, and it changes what the
+# output is worth: the fallback keeps far fewer tables. Beyond this the per-paper line is
+# suppressed, because a systematic failure would otherwise print one line per paper for the
+# rest of the corpus.
+FALLBACK_ALARM = 10
 __version__ = "0.1.0"
 
 # Every key a caller may format. Returned even by the early "nothing to do" exit, so a
@@ -329,6 +337,22 @@ class WorkerBars:
             bar.close()
 
 
+def _previous_partition(cfg: Any) -> tuple[int, int]:
+    """The split this device used last time, from its local sync marker.
+
+    `(1, 0)` when there is nothing to compare against, which reads as "the whole corpus" and
+    is the right answer for a first run.
+    """
+    path = getattr(cfg.paths, "sync_state", None)
+    if path is None or not path.exists():
+        return (1, 0)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        return (int(state.get("devices") or 1), int(state.get("device_index") or 0))
+    except (OSError, ValueError, TypeError):
+        return (1, 0)
+
+
 def run_pipeline(
     cfg: Any,
     *,
@@ -374,6 +398,19 @@ def run_pipeline(
     reclaimed = manifest.reset_stale()
     if reclaimed:
         log.info("re-queued %d row(s) left in_flight by a previous run", reclaimed)
+
+    # A changed device count reallocates the corpus by arithmetic -- the slice filter is
+    # evaluated per claim, so there is nothing stored to migrate. What is worth saying out
+    # loud is that it happened, because the numbers on the bar are about to mean something
+    # different from last time and a silently halved slice looks like lost work.
+    previous = _previous_partition(cfg)
+    if previous != (partition or (1, 0)):
+        now_devices, now_index = partition or (1, 0)
+        was_devices, was_index = previous
+        console("allocation changed since the last run here: %s → %s "
+                "(the split is recomputed per claim; nothing needs migrating)",
+                f"slice {was_index + 1} of {was_devices}",
+                f"slice {now_index + 1} of {now_devices}")
 
     # Learn what the other device has already converted, before anything is claimed. This
     # has to come before the retry snapshot and before `stats()`: a paper that failed here
@@ -497,6 +534,8 @@ def run_pipeline(
     claimed_from_pending = 0        # drives the Pending= readout as rows are claimed
 
     tallies = dict(EMPTY_TALLIES)
+    consecutive_fallbacks = 0       # see FALLBACK_ALARM
+    fallback_alarm_raised = False
     max_inflight = max(4 * cfg.convert.workers, 2 * cfg.crawl.workers)
     bar = tqdm(
         total=total_papers, initial=done_at_start,
@@ -576,6 +615,7 @@ def run_pipeline(
         return True
 
     def _record(result: TaskResult, row: PaperRow | None = None) -> None:
+        nonlocal consecutive_fallbacks, fallback_alarm_raised
         if result.status not in (DONE, NO_PDF) and row is not None \
                 and _try_again_this_run(row, result):
             # Record the attempt and its error, but leave the row `in_flight` and hand it
@@ -599,16 +639,39 @@ def run_pipeline(
                 # Worth a line: the paper is saved, but by a plainer backend than the one
                 # configured, and the difference shows up in the output.
                 tallies["fell_back"] = tallies.get("fell_back", 0) + 1
-                console("  ↳ %s converted by fallback '%s'",
-                        result.arxiv_id, result.converter)
+                consecutive_fallbacks += 1
+                if consecutive_fallbacks < FALLBACK_ALARM:
+                    console("  ↳ %s converted by fallback '%s'",
+                            result.arxiv_id, result.converter)
+                elif not fallback_alarm_raised:
+                    # Every paper taking the fallback is not a run that is going well, and
+                    # the old per-paper line said so one paper at a time -- easy to lose in a
+                    # corpus this size, and indistinguishable in the summary from a healthy
+                    # run. Say it once, plainly, and stop printing the rest.
+                    fallback_alarm_raised = True
+                    console("  ⚠ '%s' has failed on %d consecutive papers and every one was "
+                            "converted by '%s' instead. That is an install or model problem, "
+                            "not a property of the papers — and the fallback keeps far fewer "
+                            "tables, so this device's output will differ from the others. "
+                            "The cause is in %s. Further fallbacks are logged, not printed.",
+                            cfg.convert.converter, consecutive_fallbacks, result.converter,
+                            cfg.paths.logs_dir / "crawler.log")
+                    log.error("%s fell back to %s on %d consecutive papers",
+                              cfg.convert.converter, result.converter, consecutive_fallbacks)
+            else:
+                consecutive_fallbacks = 0
         elif result.status == NO_PDF:
             tallies["no_pdf"] += 1
         else:
             tallies["failed"] += 1
             # The one thing that still reaches the terminal: what broke, and on which
             # paper. Written through tqdm so it scrolls above the bar instead of
-            # shredding it.
-            console("  ✗ %s  %s", result.arxiv_id, result.error or result.status)
+            # shredding it. Clipped, because some backends raise a multi-paragraph error --
+            # a HuggingFace download failure runs to several hundred characters and buries
+            # the bar. The manifest keeps 500 and the log keeps the traceback.
+            error = " ".join((result.error or result.status).split())
+            console("  ✗ %s  %s", result.arxiv_id,
+                    error if len(error) <= 200 else error[:197] + "...")
         checkpoints.bump(result.worker_id or os.getpid(), result.status, result.arxiv_id)
         if result.worker_id:
             bars.bump(result.worker_id, result.arxiv_id)
