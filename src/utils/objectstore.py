@@ -234,6 +234,18 @@ class MinioStore:
                 if closer is not None:
                     closer()
 
+    def remove_object(self, name: str) -> bool:
+        """Delete one object. True if it was there, False if it already was not.
+
+        Deliberately narrow: the only thing that deletes here is retiring a device's marker,
+        and the corpus itself is never removed by this code. A missing object is success --
+        retiring a machine twice should not be an error.
+        """
+        if not self.exists(name):
+            return False
+        self.client.remove_object(self.settings.bucket, name)
+        return True
+
     def exists(self, name: str) -> bool:
         try:
             self.client.stat_object(self.settings.bucket, name)

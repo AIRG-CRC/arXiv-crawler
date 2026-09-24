@@ -66,6 +66,10 @@ class FakeClient:
             raise RuntimeError("not found")
         return object()
 
+    def remove_object(self, bucket, name):
+        self.calls.append(("remove", name))
+        self.objects.pop(name, None)
+
     def list_objects(self, bucket, prefix=None, recursive=False, start_after=None):
         self.listings.append(prefix)
         # Sorted, because that is the ordering real S3 listings guarantee and the one the

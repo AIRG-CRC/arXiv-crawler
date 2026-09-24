@@ -324,12 +324,6 @@ def test_an_unwritable_marker_is_not_fatal(tmp_path):
     publish_marker(store, "dev-a", SyncReport(), local_path=tmp_path / "s.json")
 
 
-def _marker(device, devices, index, *, hours_ago=0.0):
-    when = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
-    return {"device": device, "devices": devices, "device_index": index,
-            "synced_at": when.isoformat(timespec="seconds")}
-
-
 def test_a_shared_device_index_is_flagged():
     problems = check_partition_agreement(
         [_marker("dev-b", 2, 0)], "dev-a", (2, 0), announce=lambda *a: None)
@@ -499,3 +493,46 @@ def test_the_three_remaining_slices_still_cover_the_corpus():
     owners = [{p for p in papers if bucket_for(p) % 3 == i} for i in range(3)]
     assert set().union(*owners) == set(papers)
     assert sum(len(o) for o in owners) == len(papers)      # disjoint
+
+
+def test_forgetting_a_device_deletes_its_marker():
+    """`--unassign` parks a machine; `--forget` retires it.
+
+    The distinction is load-bearing: `--auto` rebuilds the fleet from the markers, so while
+    a retired machine's marker survives, every `--auto` resurrects the machine that was just
+    removed — which is a loop you cannot escape with `--unassign` alone.
+    """
+    from src.utils.sync import forget_device, marker_name, read_markers
+
+    store, client = _store()
+    for device in ("keep", "retire"):
+        publish_marker(store, device, partition=(2, 0), run={"done": 1})
+    assert {m["device"] for m in read_markers(store)} == {"keep", "retire"}
+
+    assert forget_device(store, "retire") is True
+    assert {m["device"] for m in read_markers(store)} == {"keep"}
+    assert marker_name("retire", prefix="arxiv") not in client.objects
+
+    # retiring twice is not an error -- it is the same end state
+    assert forget_device(store, "retire") is False
+
+
+def test_a_long_dead_device_outside_the_plan_stops_nagging():
+    """A marker nobody refreshes should not produce a notice for ever."""
+    plan = {"devices": 2, "assignments": {"a": 0, "b": 1}}
+    said: list[str] = []
+    check_partition_agreement([_marker("ghost", 1, 0, hours_ago=72)], "a", (2, 0),
+                              plan=plan, announce=lambda msg, *a: said.append(msg % a))
+    assert said == []
+
+    check_partition_agreement([_marker("ghost", 1, 0, hours_ago=1)], "a", (2, 0),
+                              plan=plan, announce=lambda msg, *a: said.append(msg % a))
+    assert any("not in the allocation" in line for line in said)
+    assert any("--forget ghost" in line for line in said)
+
+
+def test_remove_object_reports_whether_it_was_there():
+    store, client = _store(["arxiv/md/2301/a.md"])
+    assert store.remove_object("arxiv/md/2301/a.md") is True
+    assert store.remove_object("arxiv/md/2301/a.md") is False
+    assert "arxiv/md/2301/a.md" not in client.objects

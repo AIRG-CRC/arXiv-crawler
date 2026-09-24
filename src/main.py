@@ -378,13 +378,27 @@ def cmd_devices(cfg: Config, args: argparse.Namespace) -> int:
     me = device_name(cfg.sync)
 
     # --- changing the allocation -----------------------------------------------------
-    if args.set_devices or args.assign or args.auto or args.unassign:
-        from .utils.sync import describe_plan, plan_name, write_plan
+    if args.set_devices or args.assign or args.auto or args.unassign or args.forget:
+        from .utils.sync import describe_plan, forget_device, plan_name, write_plan
 
         existing = read_plan(store) or {}
         assignments: dict[str, int] = dict(existing.get("assignments") or {})
         devices = args.set_devices or int(existing.get("devices") or 0)
         dropped = {name.strip() for name in (args.unassign or []) if name.strip()}
+        retired = {name.strip() for name in (args.forget or []) if name.strip()}
+
+        # Retiring deletes the marker first, so the rebuild below cannot see it. Leaving the
+        # marker is what made `--auto` resurrect the machine you removed on the last run.
+        for name in sorted(retired):
+            if name == me:
+                print(f"error: refusing to forget this machine ('{me}') — run it from "
+                      f"another device", file=sys.stderr)
+                return 2
+            existed = forget_device(store, name)
+            print(f"  {'forgot' if existed else 'no marker for'} '{name}'")
+        if retired:
+            markers = [m for m in markers if m.get("device") not in retired]
+            dropped |= retired
 
         if args.auto:
             # Every device that has reported, plus this one, minus anything being dropped,
@@ -761,8 +775,12 @@ def build_parser() -> argparse.ArgumentParser:
     sdv.add_argument("--assign", action="append", metavar="NAME=INDEX",
                      help="assign one device to one slice; repeatable")
     sdv.add_argument("--unassign", action="append", metavar="NAME",
-                     help="remove one device from the allocation; with --auto the rest are "
-                          "reindexed, which is how you scale down. Repeatable")
+                     help="remove one device from the allocation but keep its marker, for a "
+                          "machine that is only away for a while. Repeatable")
+    sdv.add_argument("--forget", action="append", metavar="NAME",
+                     help="retire a device for good: delete its marker and drop it from the "
+                          "allocation, so `devices` stops listing it and --auto stops "
+                          "bringing it back. Repeatable")
     sdv.add_argument("--auto", action="store_true",
                      help="assign every device that has reported (plus this one, less any "
                           "--unassign) to a slice in name order, reindexed contiguously, "

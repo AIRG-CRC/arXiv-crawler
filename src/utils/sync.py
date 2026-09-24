@@ -329,6 +329,17 @@ def publish_marker(
         log.warning("could not publish the sync marker: %s", exc)
 
 
+def forget_device(store: MinioStore, device: str) -> bool:
+    """Delete a device's marker, so it stops appearing anywhere.
+
+    `--unassign` takes a machine out of the allocation but leaves its marker, which is right
+    for one that is only away for a while. A machine that is gone for good needs the marker
+    gone too: it is what `devices` lists, and what `--auto` rebuilds the fleet from -- so
+    while it exists, every `--auto` resurrects the machine you just removed.
+    """
+    return store.remove_object(marker_name(device, prefix=store.settings.prefix))
+
+
 def read_markers(store: MinioStore) -> list[dict[str, Any]]:
     """Every device's marker. Returns what it can; a failure here is never fatal."""
     markers: list[dict[str, Any]] = []
@@ -454,9 +465,11 @@ def check_partition_agreement(
             ran = (int(marker.get("devices", 1) or 1), int(marker.get("device_index", 0) or 0))
             expected = assignments.get(other)
             if expected is None:
-                notices.append(
-                    f"'{other}' is not in the allocation, so it follows its own config — "
-                    f"`devices --assign {other}=<n>` to bring it in")
+                if _fresh(marker):
+                    notices.append(
+                        f"'{other}' is not in the allocation, so it follows its own config "
+                        f"— `devices --assign {other}=<n>` to bring it in, or "
+                        f"`devices --forget {other}` if it is gone for good")
                 continue
             if ran != (devices, int(expected)):
                 where = (f"slice {ran[1] + 1} of {ran[0]}",
@@ -547,7 +560,8 @@ def run_sync(
 
 __all__ = [
     "Heartbeat", "ObjectStoreError", "SyncReport", "SyncSettings",
-    "check_partition_agreement", "describe_plan", "device_name", "marker_name",
+    "check_partition_agreement", "describe_plan", "device_name", "forget_device",
+    "marker_name",
     "plan_name", "plan_partition", "publish_marker", "read_markers", "read_plan",
     "run_sync", "sync_from_bucket", "write_plan",
 ]

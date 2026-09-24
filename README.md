@@ -316,6 +316,7 @@ paper through the whole path without touching the manifest. See
 python -m src.main devices      # what every machine sharing the bucket is doing
 python -m src.main devices --set-devices N --auto   # reallocate the whole fleet in one write
 python -m src.main devices --assign NAME=INDEX      # place one machine by hand
+python -m src.main devices --auto --forget NAME    # retire a machine and re-divide
 python -m src.main status       # counts by status, output size, tables extracted, last sync
 python -m src.main verify       # cross-check the manifest against files on disk
 python -m src.main checkpoint   # per-worker progress of the current or last run; --clear
@@ -629,13 +630,32 @@ To place a machine by hand, or to add one the plan does not know about:
 python -m src.main devices --assign thinkpad=3
 ```
 
-**To scale down**, name the machine that is leaving. The rest are reindexed contiguously, which
-is what keeps the allocation valid — lowering the count on its own cannot work, because whoever
-held the top slice would be left pointing at a slice that no longer exists:
+**To retire a machine for good**, forget it. That deletes its marker *and* drops it from the
+allocation, and the rest are reindexed contiguously:
 
 ```bash
-python -m src.main devices --auto --unassign mac-studio
+python -m src.main devices --auto --forget mac-studio --forget old-laptop
 ```
+
+Deleting the marker is the part that matters. `--auto` rebuilds the fleet from the markers, so a
+retired machine whose marker survives comes straight back on the next `--auto` — remove two
+machines one at a time with `--unassign` and you will watch each one undo the other. `--forget`
+ends that. It refuses to forget the machine you are running it from, so run it from one that is
+staying.
+
+**`--unassign` is the other half:** it drops a machine from the allocation but keeps its marker,
+for one that is only away for a while. On its own it does *not* reallocate — the count stays put
+and that slice is crawled by nobody until something takes it, which `devices` then reports as a
+problem. Pair it with `--auto` to re-divide, or with `--set-devices` to set the count yourself:
+
+```bash
+python -m src.main devices --set-devices 3 --unassign mac-studio    # exact, no reindexing
+python -m src.main devices --auto --unassign mac-studio             # re-derive from markers
+```
+
+Lowering the count on its own cannot work: whoever held the top slice would be left pointing at a
+slice that no longer exists, so `--set-devices 3` alone is refused with the two commands that fix
+it.
 
 ```
   3 device(s), set by CIT at 2026-09-24T03:48:17+00:00
@@ -1020,7 +1040,8 @@ attempts back into the queue:
 | `⚠ device 'X' last ran with --devices N` | Nobody has set a shared allocation, so each machine is using its own count and they disagree. `devices --set-devices N --auto` fixes it in one write. |
 | `· 'X' last ran on slice … it will pick up …` | Not a problem — a stopped machine that will adopt the new allocation when it restarts. Only the `⚠` lines need action. |
 | `the shared allocation … does not name this device` | Either this machine should be in the allocation (`devices --assign <name>=<n>`, or `devices --auto`), or it was deliberately removed and should be stopped. It refuses to fall back to its own config because that would duplicate whoever now owns that share. |
-| `… is assigned a slice that does not exist` | You lowered the count without saying which machine is leaving. `devices --auto --unassign <name>` drops one and reindexes the rest. |
+| `… is assigned a slice that does not exist` | You lowered the count without saying which machine is leaving. `devices --auto --forget <name>` retires one and reindexes the rest. |
+| `--auto` keeps bringing back a machine you removed | Its marker is still in the bucket and `--auto` rebuilds the fleet from the markers. `--forget <name>` deletes the marker; `--unassign` alone does not. |
 | `HTTP 406` or `403`, many papers at once | arXiv is refusing this IP, not rejecting the papers. Handled automatically — see [When arXiv throttles you](#when-arxiv-throttles-you). If it keeps happening, lower `--rps`. |
 | The run exited 75 | It waited out the full cooldown ladder and arXiv never relented. Wait a few hours. Do not auto-restart on 75. |
 | Many `failed_download`, `HTTP 429` | Rate limited. Lower `--rps`, wait, retry. |
@@ -1070,7 +1091,7 @@ attempts back into the queue:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-292 tests, no network required. The converter suite is skipped unless `pymupdf` is installed and
+295 tests, no network required. The converter suite is skipped unless `pymupdf` is installed and
 one memory test is Linux-only, so a clean macOS checkout reports `249 passed, 2 skipped`. The
 converter tests generate their fixture PDFs at run time, so no binaries are committed; the
 cooldown tests drive a stubbed HTTP response and the sync tests a fake MinIO client, so nothing
