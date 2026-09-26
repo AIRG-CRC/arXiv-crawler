@@ -38,6 +38,14 @@ crawl:
   cooldown_max_seconds: 21600
   cooldown_escalate: true
   cooldown_max_rounds: 4
+  # --- stuck papers ---
+  # arXiv also answers 406 for some single papers (e.g. withdrawn ones) while serving
+  # everything else, and a cooldown can never clear that. So before cooling down the
+  # crawler fetches `canary_id`, a known-good paper: if it downloads, the refusal is about
+  # this paper alone -- it gets `stuck_paper_attempts` short retries, then is recorded
+  # no_pdf and the run carries on. `canary_id: null` treats every 406 as a block again.
+  canary_id: "1706.03762"
+  stuck_paper_attempts: 3
 
 convert:
   converter: docling # pymupdf | pdfplumber | docling | opendataloader

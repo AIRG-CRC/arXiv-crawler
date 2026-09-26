@@ -115,6 +115,14 @@ class Crawl:
     cooldown_max_seconds: int = 21600
     cooldown_escalate: bool = True
     cooldown_max_rounds: int = 4
+    # --- stuck papers ---
+    # arXiv also answers 406 for some single papers (withdrawn ones) while serving everything
+    # else. On a throttle status the crawler first fetches `canary_id`, a known-good paper;
+    # if that downloads, the refusal is about this paper alone, so it gets
+    # `stuck_paper_attempts` short retries and is then recorded `no_pdf` instead of starting
+    # a cooldown. Set `canary_id` to null to treat every 406 as a block, as before.
+    canary_id: str | None = "1706.03762"
+    stuck_paper_attempts: int = 3
 
 
 @dataclass

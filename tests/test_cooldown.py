@@ -228,15 +228,27 @@ class _Resp:
     def close(self):
         self.closed = True
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
 
 class _Session:
     """Stands in for ArxivSession, handing out a scripted sequence of responses."""
 
-    def __init__(self, cfg, responses, cooldown):
+    def __init__(self, cfg, responses, cooldown, canary_ok=False):
         self.cfg = cfg
         self.cooldown = cooldown
         self.requests = 0
+        self.probes = 0
+        self.canary_ok = canary_ok
         self._responses = list(responses)
+
+    def host_answers(self, limiter):
+        self.probes += 1
+        return self.canary_ok
 
     @property
     def session(self):
@@ -256,9 +268,9 @@ class _Cfg:
     chunk_size = 4096
 
 
-def _run_download(tmp_path, responses, cooldown):
+def _run_download(tmp_path, responses, cooldown, canary_ok=False):
     row = PaperRow(arxiv_id="2301.00001", version="v1", shard="2301")
-    session = _Session(_Cfg(), responses, cooldown)
+    session = _Session(_Cfg(), responses, cooldown, canary_ok)
     limiter = C.RateLimiter(1000.0, 1000)
     return session, C.download_one(row, session, limiter, tmp_path, threading.Event())
 
@@ -339,6 +351,81 @@ def test_an_interrupt_before_the_request_spends_nothing(tmp_path):
     outcome = C.download_one(row, session, C.RateLimiter(1000.0, 1000), tmp_path, stop)
     assert outcome.status == PENDING
     assert session.requests == 0
+
+
+# --- a 406 about one paper, not about us ---------------------------------------------
+def test_a_paper_refused_while_the_canary_downloads_is_skipped_without_a_cooldown(tmp_path):
+    """The 0805.3847 case: a withdrawn paper answers 406 forever while the host is fine."""
+    cd = _cooldown(seconds=0.01)
+    session, outcome = _run_download(tmp_path, [_Resp(406)] * 3, cd, canary_ok=True)
+    assert outcome.status == NO_PDF
+    assert "406" in outcome.error and "3 tries" in outcome.error
+    assert session.requests == 3             # stuck_paper_attempts, default 3
+    assert cd.rounds_served == 0             # nobody else was paused for it
+
+
+def test_stuck_paper_attempts_is_configurable(tmp_path):
+    class Cfg(_Cfg):
+        stuck_paper_attempts = 2
+    cd = _cooldown(seconds=0.01)
+    row = PaperRow(arxiv_id="2301.00001", version="v1", shard="2301")
+    session = _Session(Cfg(), [_Resp(406)] * 2, cd, canary_ok=True)
+    outcome = C.download_one(row, session, C.RateLimiter(1000.0, 1000), tmp_path,
+                             threading.Event())
+    assert outcome.status == NO_PDF
+    assert session.requests == 2
+
+
+def test_a_transient_per_paper_406_still_downloads(tmp_path):
+    cd = _cooldown(seconds=0.01)
+    _, outcome = _run_download(
+        tmp_path, [_Resp(406), _Resp(200, b"%PDF-1.7 body")], cd, canary_ok=True)
+    assert outcome.status == DONE
+    assert cd.rounds_served == 0
+
+
+def test_a_block_page_does_not_consult_the_canary(tmp_path):
+    cd = _cooldown(seconds=0.01)
+    session, outcome = _run_download(tmp_path, [
+        _Resp(200, b"<html>Access denied: automated requests</html>"),
+        _Resp(200, b"%PDF-1.7 body"),
+    ], cd, canary_ok=True)
+    assert outcome.status == DONE
+    assert session.probes == 0
+    assert cd.rounds_served == 1
+
+
+class _ProbeCfg(_Cfg):
+    base_url = "https://export.arxiv.org"
+    canary_id = "1706.03762"
+
+
+def _probe_session(cfg, *responses):
+    s = C.ArxivSession(cfg)
+    fake = _Session(cfg, responses, s.cooldown)
+    s._local.session = fake                  # the thread-local requests.Session
+    return s, fake
+
+
+def test_host_answers_true_for_a_pdf_and_caches_it():
+    s, fake = _probe_session(_ProbeCfg(), _Resp(200, b"%PDF-1.7 x"))
+    limiter = C.RateLimiter(1000.0, 1000)
+    assert s.host_answers(limiter) is True
+    assert s.host_answers(limiter) is True
+    assert fake.requests == 1                # second verdict came from the cache
+
+
+def test_host_answers_false_when_the_canary_is_refused_too():
+    s, _ = _probe_session(_ProbeCfg(), _Resp(406))
+    assert s.host_answers(C.RateLimiter(1000.0, 1000)) is False
+
+
+def test_host_answers_false_without_a_canary():
+    class Cfg(_ProbeCfg):
+        canary_id = None
+    s, fake = _probe_session(Cfg())
+    assert s.host_answers(C.RateLimiter(1000.0, 1000)) is False
+    assert fake.requests == 0
 
 
 # --- the pieces the cooldown leans on ------------------------------------------------

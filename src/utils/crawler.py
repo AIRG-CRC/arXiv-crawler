@@ -58,6 +58,8 @@ log = logging.getLogger(__name__)
 
 PDF_MAGIC = b"%PDF-"
 RETRY_STATUS = {429, 500, 502, 503, 504}
+# How long one canary verdict stands (see `ArxivSession.host_answers`).
+CANARY_TTL = 60.0
 # Consecutive fallbacks before the run says the configured converter is simply broken. A
 # handful is normal -- some PDFs defeat docling and pymupdf picks them up. Ten in a row is
 # not a property of the papers, it is a property of the install, and it changes what the
@@ -119,6 +121,9 @@ class ArxivSession:
         # as it was. A disabled default keeps `ArxivSession(cfg)` usable on its own.
         self.cooldown = cooldown or Cooldown(stop=threading.Event(), seconds=0)
         self._local = threading.local()
+        self._probe_lock = threading.Lock()
+        self._probe_at = float("-inf")
+        self._probe_ok = False
 
     @property
     def session(self) -> requests.Session:
@@ -134,6 +139,36 @@ class ArxivSession:
 
     def pdf_url(self, row: PaperRow) -> str:
         return f"{self.cfg.base_url.rstrip('/')}/pdf/{row.arxiv_id}{row.version}"
+
+    def host_answers(self, limiter: RateLimiter) -> bool:
+        """Does arXiv still serve a known-good PDF? Tells a per-paper 406 from a real block.
+
+        arXiv answers 406 for some withdrawn papers as well as for a blocked client, and
+        the status alone cannot separate them. Fetching `crawl.canary_id` can: if it comes
+        back as a PDF, the host is talking to us and the refusal is about that one paper.
+        The answer is cached for `CANARY_TTL` so a burst of throttles from several threads
+        costs one probe, not one each. Any doubt -- no canary configured, a network error,
+        a non-PDF body -- answers False, which keeps the conservative cooldown behaviour.
+        """
+        canary = getattr(self.cfg, "canary_id", None)
+        if not canary:
+            return False
+        with self._probe_lock:
+            if time.monotonic() - self._probe_at < CANARY_TTL:
+                return self._probe_ok
+            ok = False
+            limiter.acquire()
+            url = f"{self.cfg.base_url.rstrip('/')}/pdf/{canary}"
+            try:
+                with self.session.get(url, timeout=self.cfg.timeout, stream=True) as resp:
+                    if resp.status_code == 200:
+                        head = next(resp.iter_content(chunk_size=1024), b"")
+                        ok = head.startswith(PDF_MAGIC)
+            except requests.RequestException as exc:
+                log.warning("canary %s failed: %s", canary, exc)
+            log.info("canary %s: host %s", canary, "answers" if ok else "refuses")
+            self._probe_at, self._probe_ok = time.monotonic(), ok
+            return ok
 
 
 class DownloadOutcome:
@@ -189,6 +224,8 @@ def download_one(
     last_error = "unknown error"
     attempt = 0
     throttle_waits = 0
+    stuck_hits = 0          # throttles the canary proved were about this paper alone
+    stuck_limit = max(int(getattr(cfg, "stuck_paper_attempts", 3)), 1)
 
     while attempt < cfg.max_attempts:
         if stop.is_set():
@@ -204,6 +241,7 @@ def download_one(
         limiter.acquire()
         response = None
         throttled: int | None = None
+        blocked = False
         retry_after: float | None = None
         try:
             response = session.session.get(url, timeout=cfg.timeout, stream=True)
@@ -228,7 +266,6 @@ def download_one(
 
                 digest = hashlib.sha256()
                 size = 0
-                blocked = False
                 with part.open("wb") as fh:
                     for chunk in response.iter_content(chunk_size=cfg.chunk_size):
                         if not chunk:
@@ -271,6 +308,23 @@ def download_one(
         # `finally` above: a streamed connection and its pooled socket must not be held open
         # across a wait measured in hours.
         last_error = f"HTTP {throttled} (arXiv throttle)"
+        if not blocked and session.host_answers(limiter):
+            # A block page is unambiguous; a bare status is not. The canary downloaded, so
+            # arXiv is refusing this one paper (seen with withdrawn ones), not us. Pausing
+            # every download for it would stall the run for hours and then end it, and the
+            # next run would claim the same paper first -- give it a few short tries, then
+            # record it `no_pdf` so it leaves the queue for good.
+            cooldown.note_clean()
+            stuck_hits += 1
+            if stuck_hits >= stuck_limit:
+                log.warning("skipping %s: HTTP %s %d time(s) while other papers download",
+                            row.arxiv_id, throttled, stuck_hits)
+                return DownloadOutcome(
+                    status=NO_PDF,
+                    error=f"HTTP {throttled} on this paper only; skipped after {stuck_hits} tries",
+                )
+            _sleep_for_retry(None, stuck_hits, stop)
+            continue
         if throttle_waits >= cooldown.max_rounds or not cooldown.trip(
                 generation, throttled, row.arxiv_id, retry_after):
             # Either this one paper has waited out its share of rounds, or the run is over.
