@@ -201,6 +201,32 @@ def _sleep_for_retry(response: requests.Response | None, attempt: int, stop: thr
     stop.wait(delay)
 
 
+def fill_pool(pool: ProcessPoolExecutor) -> int:
+    """Start every worker `pool` is allowed, now, and return how many it has.
+
+    Under the spawn start method -- which `max_tasks_per_child` forces -- the executor
+    starts a process only when a task arrives and no worker is idle, and replaces a
+    recycled one only on the same condition. While downloads trickle in, the pool sits at
+    two or three processes and the rest of `convert.workers` never exists; each paper that
+    does arrive then pays for a cold start. Calling this after every result keeps the pool
+    at full strength instead.
+
+    Leans on executor internals (stable from 3.9 through 3.13). If they are not there, it
+    does nothing and the pool keeps its stock on-demand behaviour.
+    """
+    processes = getattr(pool, "_processes", None)
+    spawn = getattr(pool, "_spawn_process", None)
+    lock = getattr(pool, "_shutdown_lock", None)
+    if processes is None or spawn is None or lock is None:
+        return len(processes or ())
+    with lock:
+        if getattr(pool, "_shutdown_thread", False) or getattr(pool, "_broken", False):
+            return len(processes)
+        while len(processes) < pool._max_workers:
+            spawn()
+    return len(processes)
+
+
 def download_one(
     row: PaperRow,
     session: ArxivSession,
@@ -639,6 +665,14 @@ def run_pipeline(
     in_run_budget = getattr(retry_cfg, "in_run_attempts", 1) if in_run_enabled else 0
     fresh_dispatched = 0        # newly claimed rows in the last _claim; see the loop
 
+    def _fill_cv_pool() -> None:
+        # Guarded: failing to pre-start workers must never end the run -- the pool would
+        # still start them on demand, just as it did before.
+        try:
+            fill_pool(cv_pool)
+        except Exception:
+            log.exception("could not pre-start conversion workers; starting on demand")
+
     def _live_workers() -> int:
         """How many conversion processes the pool currently has. Best-effort: the
         attribute is private, so an unexpected shape falls back to the configured count
@@ -893,6 +927,7 @@ def run_pipeline(
             cv_pool = ProcessPoolExecutor(cfg.convert.workers, **pool_kwargs)
     else:
         cv_pool = ProcessPoolExecutor(cfg.convert.workers, **pool_kwargs)
+    _fill_cv_pool()
     downloads: set[Future] = set()
     conversions: dict[Future, PaperRow] = {}
     dispatched = 0
@@ -974,6 +1009,7 @@ def run_pipeline(
                 else:
                     row = conversions.pop(fut)
                     started_at.pop(fut, None)
+                    _fill_cv_pool()             # replace a worker that just recycled
                     warned.discard(fut)
                     try:
                         _record(fut.result(), row)
