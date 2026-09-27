@@ -46,6 +46,15 @@ crawl:
   # no_pdf and the run carries on. `canary_id: null` treats every 406 as a block again.
   canary_id: "1706.03762"
   stuck_paper_attempts: 3
+  # --- broken transfers ---
+  # A download cut off mid-body (ChunkedEncodingError / IncompleteRead) is resumed from the
+  # byte it stopped at with an HTTP Range request, so a retry does not re-fetch what
+  # already arrived. A paper still failing after `max_attempts` on `base_url` is tried
+  # `fallback_attempts` more times on `fallback_base_url`, from scratch. arXiv asks bots
+  # to use export.arxiv.org, so this is only ever used for papers that already failed
+  # there, and still goes through the same rate limit. Null disables the fallback.
+  fallback_base_url: https://arxiv.org
+  fallback_attempts: 2
 
 convert:
   converter: docling # pymupdf | pdfplumber | docling | opendataloader

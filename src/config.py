@@ -123,6 +123,12 @@ class Crawl:
     # a cooldown. Set `canary_id` to null to treat every 406 as a block, as before.
     canary_id: str | None = "1706.03762"
     stuck_paper_attempts: int = 3
+    # --- fallback host ---
+    # A paper that exhausts `max_attempts` on `base_url` with a transfer error (not a 404,
+    # not a throttle) gets `fallback_attempts` more tries here, from scratch. Null or 0
+    # disables it.
+    fallback_base_url: str | None = "https://arxiv.org"
+    fallback_attempts: int = 2
 
 
 @dataclass

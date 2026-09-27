@@ -137,8 +137,8 @@ class ArxivSession:
             self._local.session = s
         return s
 
-    def pdf_url(self, row: PaperRow) -> str:
-        return f"{self.cfg.base_url.rstrip('/')}/pdf/{row.arxiv_id}{row.version}"
+    def pdf_url(self, row: PaperRow, base: str | None = None) -> str:
+        return f"{(base or self.cfg.base_url).rstrip('/')}/pdf/{row.arxiv_id}{row.version}"
 
     def host_answers(self, limiter: RateLimiter) -> bool:
         """Does arXiv still serve a known-good PDF? Tells a per-paper 406 from a real block.
@@ -227,6 +227,36 @@ def fill_pool(pool: ProcessPoolExecutor) -> int:
     return len(processes)
 
 
+def _resume_offset(part: Path) -> int:
+    try:
+        return part.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _hash_file(path: Path, digest: Any, chunk_size: int) -> None:
+    with path.open("rb") as fh:
+        while chunk := fh.read(chunk_size):
+            digest.update(chunk)
+
+
+def _hosts(session: ArxivSession, row: PaperRow) -> list[tuple[str, str, int]]:
+    """(label, url, attempts) for each host to try, in order.
+
+    `export.arxiv.org` first, as arXiv asks of automated clients. `crawl.fallback_base_url`
+    (normally arxiv.org) gets `crawl.fallback_attempts` more tries, and only for a paper
+    that has already failed on the primary with a transfer error -- a 404 or a throttle
+    ends the paper before this list is walked any further.
+    """
+    cfg = session.cfg
+    hosts = [(cfg.base_url, session.pdf_url(row), cfg.max_attempts)]
+    fallback = getattr(cfg, "fallback_base_url", None)
+    tries = int(getattr(cfg, "fallback_attempts", 0) or 0)
+    if fallback and tries > 0 and fallback.rstrip("/") != cfg.base_url.rstrip("/"):
+        hosts.append((fallback, session.pdf_url(row, base=fallback), tries))
+    return [(base.split("//", 1)[-1].rstrip("/"), url, n) for base, url, n in hosts]
+
+
 def download_one(
     row: PaperRow,
     session: ArxivSession,
@@ -240,124 +270,173 @@ def download_one(
     spend one: waiting out a block the server is applying to every request is not an attempt
     at this paper. `throttle_waits` bounds that separately, so one pathological paper cannot
     park a download thread indefinitely.
+
+    A transfer cut off mid-body keeps its `.part`, and the next attempt asks only for the
+    rest with a `Range` request. arXiv's CDN drops connections on 1 MiB segment boundaries,
+    so without this every retry re-downloads the megabytes that already arrived and meets
+    the same cut. When a host's attempts run out, the next host in `_hosts` starts over
+    from byte zero: splicing bytes from two servers risks a PDF that is silently corrupt.
     """
     cfg = session.cfg
     cooldown = session.cooldown
     target = staged_pdf_path(data_dir, row.arxiv_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_suffix(".pdf.part")
-    url = session.pdf_url(row)
+    part.unlink(missing_ok=True)        # a previous run's fragment: provenance unknown
     last_error = "unknown error"
-    attempt = 0
     throttle_waits = 0
     stuck_hits = 0          # throttles the canary proved were about this paper alone
     stuck_limit = max(int(getattr(cfg, "stuck_paper_attempts", 3)), 1)
+    hosts = _hosts(session, row)
 
-    while attempt < cfg.max_attempts:
-        if stop.is_set():
-            # The user interrupted; this paper did not fail. Hand it straight back to
-            # `pending` without burning an attempt, so a plain `run` picks it up again.
-            # Checked *before* the cooldown gate on purpose: on Ctrl-C every queued download
-            # returns here in microseconds instead of blocking on a gate that, mid-cooldown,
-            # nobody is going to reopen in time for `dl_pool.shutdown(wait=True)`.
-            return DownloadOutcome(status=PENDING)
-        generation = cooldown.enter()
-        if generation is None:
-            return DownloadOutcome(status=PENDING)
-        limiter.acquire()
-        response = None
-        throttled: int | None = None
-        blocked = False
-        retry_after: float | None = None
-        try:
-            response = session.session.get(url, timeout=cfg.timeout, stream=True)
+    for host_no, (host, url, max_attempts) in enumerate(hosts):
+        if host_no:
+            part.unlink(missing_ok=True)
+            log.info("%s failed on %s (%s); falling back to %s",
+                     row.arxiv_id, hosts[host_no - 1][0], last_error, host)
+        attempt = 0
+        while attempt < max_attempts:
+            if stop.is_set():
+                # The user interrupted; this paper did not fail. Hand it straight back to
+                # `pending` without burning an attempt, so a plain `run` picks it up
+                # again. Checked *before* the cooldown gate on purpose: on Ctrl-C every
+                # queued download returns here in microseconds instead of blocking on a
+                # gate that, mid-cooldown, nobody is going to reopen in time for
+                # `dl_pool.shutdown(wait=True)`.
+                return DownloadOutcome(status=PENDING)
+            generation = cooldown.enter()
+            if generation is None:
+                return DownloadOutcome(status=PENDING)
+            limiter.acquire()
+            response = None
+            throttled: int | None = None
+            blocked = False
+            retry_after: float | None = None
+            offset = _resume_offset(part)
+            headers = {"Range": f"bytes={offset}-"} if offset else None
+            try:
+                response = session.session.get(url, timeout=cfg.timeout, stream=True,
+                                               headers=headers)
 
-            if response.status_code in cooldown.statuses:
-                # First, and before raise_for_status: 403/406 are 4xx, so the generic
-                # handler below would otherwise spend an attempt -- and all five of them
-                # within a few seconds -- on a status that says nothing about this paper.
-                # The wait itself happens after the `try`, once the response is closed.
-                throttled = response.status_code
-                retry_after = _retry_after_seconds(response)
-            elif response.status_code == 404:
-                cooldown.note_clean()
-                return DownloadOutcome(status=NO_PDF, error="404 (withdrawn or no PDF)")
-            elif response.status_code in RETRY_STATUS:
-                last_error = f"HTTP {response.status_code}"
+                if response.status_code in cooldown.statuses:
+                    # First, and before raise_for_status: 403/406 are 4xx, so the generic
+                    # handler below would otherwise spend an attempt -- and all five of
+                    # them within a few seconds -- on a status that says nothing about
+                    # this paper. The wait itself happens after the `try`, once the
+                    # response is closed.
+                    throttled = response.status_code
+                    retry_after = _retry_after_seconds(response)
+                elif response.status_code == 404:
+                    cooldown.note_clean()
+                    return DownloadOutcome(status=NO_PDF, error="404 (withdrawn or no PDF)")
+                elif response.status_code in RETRY_STATUS:
+                    last_error = f"HTTP {response.status_code}"
+                    _sleep_for_retry(response, attempt, stop)
+                    attempt += 1
+                    continue
+                else:
+                    if response.status_code == 416:
+                        # The range is past the end: the fragment is not what we thought.
+                        part.unlink(missing_ok=True)
+                        raise ValueError(f"HTTP 416 resuming at byte {offset}")
+                    response.raise_for_status()
+
+                    resuming = offset > 0 and response.status_code == 206
+                    if resuming:
+                        got = response.headers.get("Content-Range", "")
+                        if not got.startswith(f"bytes {offset}-"):
+                            part.unlink(missing_ok=True)
+                            raise ValueError(f"resume at {offset} answered {got!r}")
+                        log.info("resuming %s from byte %d on %s", row.arxiv_id, offset, host)
+                    # A 200 to a Range request is the whole file again: start over.
+
+                    digest = hashlib.sha256()
+                    size = 0
+                    if resuming:
+                        _hash_file(part, digest, cfg.chunk_size)
+                        size = offset
+                    with part.open("ab" if resuming else "wb") as fh:
+                        for chunk in response.iter_content(chunk_size=cfg.chunk_size):
+                            if not chunk:
+                                continue
+                            if size == 0 and not chunk.startswith(PDF_MAGIC):
+                                # arXiv answers 200 with HTML for two unrelated reasons: a
+                                # "PDF is being generated" interstitial, which is per-paper
+                                # and transient, and a block page, which is neither. The
+                                # status code proves nothing either way -- only the body
+                                # separates them.
+                                log.warning("non-PDF body for %s: %r",
+                                            row.arxiv_id, chunk[:200])
+                                if cooldown.enabled and looks_like_block_page(chunk):
+                                    throttled = response.status_code
+                                    blocked = True
+                                    break
+                                raise ValueError("response body is not a PDF")
+                            fh.write(chunk)
+                            digest.update(chunk)
+                            size += len(chunk)
+
+                    if blocked:
+                        part.unlink(missing_ok=True)
+                    elif size == 0:
+                        raise ValueError("empty response body")
+                    else:
+                        os.replace(part, target)   # atomic: never a truncated-looking PDF
+                        cooldown.note_clean()
+                        return DownloadOutcome(path=target, size=size,
+                                               sha256=digest.hexdigest())
+
+            except (requests.RequestException, ValueError, OSError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                # A connection that broke mid-body leaves a good prefix: keep it for the
+                # Range request. Anything else -- a bad status, a non-PDF body, a disk
+                # error -- says nothing trustworthy about the bytes on disk.
+                transfer_broke = (isinstance(exc, requests.RequestException)
+                                  and not isinstance(exc, requests.HTTPError))
+                if not transfer_broke:
+                    part.unlink(missing_ok=True)
                 _sleep_for_retry(response, attempt, stop)
                 attempt += 1
                 continue
-            else:
-                response.raise_for_status()
+            finally:
+                if response is not None:
+                    response.close()
 
-                digest = hashlib.sha256()
-                size = 0
-                with part.open("wb") as fh:
-                    for chunk in response.iter_content(chunk_size=cfg.chunk_size):
-                        if not chunk:
-                            continue
-                        if size == 0 and not chunk.startswith(PDF_MAGIC):
-                            # arXiv answers 200 with HTML for two unrelated reasons: a "PDF
-                            # is being generated" interstitial, which is per-paper and
-                            # transient, and a block page, which is neither. The status code
-                            # proves nothing either way -- only the body separates them.
-                            log.warning("non-PDF body for %s: %r", row.arxiv_id, chunk[:200])
-                            if cooldown.enabled and looks_like_block_page(chunk):
-                                throttled = response.status_code
-                                blocked = True
-                                break
-                            raise ValueError("response body is not a PDF")
-                        fh.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
-
-                if blocked:
+            # Only a throttle reaches here, and only with the response already closed by
+            # the `finally` above: a streamed connection and its pooled socket must not be
+            # held open across a wait measured in hours.
+            last_error = f"HTTP {throttled} (arXiv throttle)"
+            if not blocked and session.host_answers(limiter):
+                # A block page is unambiguous; a bare status is not. The canary
+                # downloaded, so arXiv is refusing this one paper (seen with withdrawn
+                # ones), not us. Pausing every download for it would stall the run for
+                # hours and then end it, and the next run would claim the same paper
+                # first -- give it a few short tries, then record it `no_pdf` so it
+                # leaves the queue for good.
+                cooldown.note_clean()
+                stuck_hits += 1
+                if stuck_hits >= stuck_limit:
+                    log.warning("skipping %s: HTTP %s %d time(s) while other papers "
+                                "download", row.arxiv_id, throttled, stuck_hits)
                     part.unlink(missing_ok=True)
-                elif size == 0:
-                    raise ValueError("empty response body")
-                else:
-                    os.replace(part, target)   # atomic: never a truncated-looking PDF
-                    cooldown.note_clean()
-                    return DownloadOutcome(path=target, size=size, sha256=digest.hexdigest())
+                    return DownloadOutcome(
+                        status=NO_PDF,
+                        error=f"HTTP {throttled} on this paper only; "
+                              f"skipped after {stuck_hits} tries",
+                    )
+                _sleep_for_retry(None, stuck_hits, stop)
+                continue
+            if throttle_waits >= cooldown.max_rounds or not cooldown.trip(
+                    generation, throttled, row.arxiv_id, retry_after):
+                # Either this one paper has waited out its share of rounds, or the run is
+                # over. `PENDING` hands it back untouched -- no attempt, no failure.
+                part.unlink(missing_ok=True)
+                return DownloadOutcome(status=PENDING)
+            throttle_waits += 1
 
-        except (requests.RequestException, ValueError, OSError) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            part.unlink(missing_ok=True)
-            _sleep_for_retry(response, attempt, stop)
-            attempt += 1
-            continue
-        finally:
-            if response is not None:
-                response.close()
-
-        # Only a throttle reaches here, and only with the response already closed by the
-        # `finally` above: a streamed connection and its pooled socket must not be held open
-        # across a wait measured in hours.
-        last_error = f"HTTP {throttled} (arXiv throttle)"
-        if not blocked and session.host_answers(limiter):
-            # A block page is unambiguous; a bare status is not. The canary downloaded, so
-            # arXiv is refusing this one paper (seen with withdrawn ones), not us. Pausing
-            # every download for it would stall the run for hours and then end it, and the
-            # next run would claim the same paper first -- give it a few short tries, then
-            # record it `no_pdf` so it leaves the queue for good.
-            cooldown.note_clean()
-            stuck_hits += 1
-            if stuck_hits >= stuck_limit:
-                log.warning("skipping %s: HTTP %s %d time(s) while other papers download",
-                            row.arxiv_id, throttled, stuck_hits)
-                return DownloadOutcome(
-                    status=NO_PDF,
-                    error=f"HTTP {throttled} on this paper only; skipped after {stuck_hits} tries",
-                )
-            _sleep_for_retry(None, stuck_hits, stop)
-            continue
-        if throttle_waits >= cooldown.max_rounds or not cooldown.trip(
-                generation, throttled, row.arxiv_id, retry_after):
-            # Either this one paper has waited out its share of rounds, or the run is over.
-            # `PENDING` hands it back untouched -- no attempt, no failure recorded.
-            return DownloadOutcome(status=PENDING)
-        throttle_waits += 1
-
+    part.unlink(missing_ok=True)
+    if len(hosts) > 1:
+        last_error = f"{last_error} (also tried {', '.join(h for h, _, _ in hosts[1:])})"
     return DownloadOutcome(status=FAILED_DOWNLOAD, error=last_error[:500])
 
 

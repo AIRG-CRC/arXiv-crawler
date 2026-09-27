@@ -212,14 +212,18 @@ def test_block_page_sniffing_is_conservative():
 class _Resp:
     """The slice of requests.Response that download_one touches."""
 
-    def __init__(self, status, body=b"", headers=None):
+    def __init__(self, status, body=b"", headers=None, broken=False):
         self.status_code = status
         self.headers = headers or {}
         self._body = body
+        self._broken = broken          # the connection drops after `body`
         self.closed = False
 
     def iter_content(self, chunk_size=0):
-        yield self._body
+        if self._body:
+            yield self._body
+        if self._broken:
+            raise C.requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead")
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -242,6 +246,7 @@ class _Session:
         self.cfg = cfg
         self.cooldown = cooldown
         self.requests = 0
+        self.calls = []                  # (url, Range header or None)
         self.probes = 0
         self.canary_ok = canary_ok
         self._responses = list(responses)
@@ -254,15 +259,17 @@ class _Session:
     def session(self):
         return self
 
-    def get(self, url, timeout=None, stream=False):
+    def get(self, url, timeout=None, stream=False, headers=None):
         self.requests += 1
+        self.calls.append((url, (headers or {}).get("Range")))
         return self._responses.pop(0)
 
-    def pdf_url(self, row):
-        return "http://example.invalid/pdf/x"
+    def pdf_url(self, row, base=None):
+        return f"{base or self.cfg.base_url}/pdf/x"
 
 
 class _Cfg:
+    base_url = "http://export.invalid"
     max_attempts = 3
     timeout = 1
     chunk_size = 4096
@@ -396,7 +403,6 @@ def test_a_block_page_does_not_consult_the_canary(tmp_path):
 
 
 class _ProbeCfg(_Cfg):
-    base_url = "https://export.arxiv.org"
     canary_id = "1706.03762"
 
 
