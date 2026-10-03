@@ -118,11 +118,20 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
                     f"'{cfg.convert.converter}'")
         if share > 20:
             summary += (" — that is high enough to be a broken install rather than awkward "
-                        "PDFs; those papers keep far fewer tables and are worth re-running "
-                        "once it is fixed")
-    if tallies.get("processed"):
+                        "PDFs; those papers keep far fewer tables")
+        if getattr(cfg.convert, "upgrade_fallbacks", True):
+            summary += f". The next run re-converts them with '{cfg.convert.converter}'"
+    upgraded, upgrade_failed = tallies.get("upgraded", 0), tallies.get("upgrade_failed", 0)
+    if upgraded or upgrade_failed:
+        upgrade_line = (f"re-converted {upgraded:,} earlier fallback paper(s) with "
+                        f"'{cfg.convert.converter}'"
+                        + (f"; {upgrade_failed:,} failed again and keep their "
+                           f"'{cfg.convert.fallback_converter}' output" if upgrade_failed else ""))
+        log.info("%s", upgrade_line)
+        summary = f"{summary}\n{upgrade_line}" if tallies.get("processed") else upgrade_line
+    if tallies.get("processed") or upgraded or upgrade_failed:
         print(summary)
-        if tallies.get("failed"):
+        if tallies.get("failed") or upgrade_failed:
             print(f"full detail in {cfg.paths.logs_dir / 'crawler.log'}")
     if tallies.get("throttled_out"):
         message = ("arXiv was still refusing requests after the full cooldown ladder, so the "
@@ -196,6 +205,55 @@ def cmd_dump(cfg: Config, args: argparse.Namespace) -> int:
     if report.failed:
         print("re-run `dump` to retry the failures — the local copies are still there")
     return 1 if report.failed else 0
+
+
+def cmd_find_fallbacks(cfg: Config, args: argparse.Namespace) -> int:
+    """Work out which finished papers were converted by the fallback backend."""
+    from .utils.state import Manifest
+    from .utils.upgrade import scan_bucket, scan_log, unknown_converter_ids
+
+    fallback = cfg.convert.fallback_converter
+    with Manifest(cfg.paths.manifest_db) as manifest:
+        from_log = scan_log(manifest, cfg.paths.logs_dir / "crawler.log",
+                            cfg.paths.manifest_db.with_suffix(".logscan.json"))
+        print(f"log: {from_log:,} paper(s) newly identified as fallback conversions")
+
+        if args.from_bucket:
+            from tqdm import tqdm
+
+            from .utils.objectstore import MinioSettings, MinioStore, ObjectStoreError
+
+            try:
+                settings = MinioSettings.from_config(cfg.minio)
+                settings.validate()
+                store = MinioStore(settings)
+            except ObjectStoreError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            unknown = len(unknown_converter_ids(manifest))
+            target = min(unknown, args.limit) if args.limit else unknown
+            print(f"bucket: reading the front matter of {target:,} paper(s) this device "
+                  f"converted before the converter was recorded")
+            bar = tqdm(total=target, unit="paper", desc="find-fallbacks", smoothing=0.05)
+            try:
+                counts = scan_bucket(manifest, store, limit=args.limit, progress=bar.update)
+            finally:
+                bar.close()
+            examined, unreadable = counts.pop("examined"), counts.pop("unreadable")
+            by_backend = ", ".join(f"{n:,} by {name}" for name, n in sorted(counts.items()))
+            print(f"bucket: examined {examined:,}: {by_backend or 'none readable'}"
+                  + (f"; {unreadable:,} unreadable or without a converter field"
+                     if unreadable else ""))
+
+        waiting = len(manifest.upgrade_candidates(
+            fallback, max_attempts=cfg.convert.upgrade_max_attempts)) if fallback else 0
+        unknown = len(unknown_converter_ids(manifest))
+    print(f"{waiting:,} paper(s) are queued to be re-converted with "
+          f"'{cfg.convert.converter}' on the next run")
+    if unknown and not args.from_bucket:
+        print(f"{unknown:,} paper(s) converted here have no recorded converter; "
+              f"`find-fallbacks --from-bucket` reads it from the bucket")
+    return 0
 
 
 def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
@@ -763,6 +821,16 @@ def build_parser() -> argparse.ArgumentParser:
     sy.add_argument("--force", action="store_true",
                     help="sync even though a run looks like it is in flight")
     sy.set_defaults(func=cmd_sync)
+
+    sff = sub.add_parser("find-fallbacks",
+                         help="identify papers converted by the fallback backend, so the "
+                              "next run re-converts them")
+    sff.add_argument("--from-bucket", action="store_true",
+                     help="also read each paper's front matter from the bucket (one small "
+                          "request per paper this device converted)")
+    sff.add_argument("--limit", type=int, metavar="N",
+                     help="with --from-bucket, examine at most N papers")
+    sff.set_defaults(func=cmd_find_fallbacks)
 
     sdv = sub.add_parser("devices",
                          help="what every machine sharing the bucket is doing")

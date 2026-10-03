@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS papers (
   error            TEXT,
   completed_at     TEXT,
   remote_only      INTEGER NOT NULL DEFAULT 0,  -- output is in the bucket, not on disk
-  bucket           INTEGER NOT NULL DEFAULT -1  -- crc32(arxiv_id) %% 256; the device slice
+  bucket           INTEGER NOT NULL DEFAULT -1, -- crc32(arxiv_id) %% 256; the device slice
+  converter        TEXT,      -- backend that produced it *here*; NULL if another device did
+  upgrade_attempts INTEGER NOT NULL DEFAULT 0   -- failed tries at replacing a fallback
 );
 CREATE INDEX IF NOT EXISTS idx_papers_status ON papers(status);
 CREATE INDEX IF NOT EXISTS idx_papers_cat    ON papers(primary_category);
@@ -62,6 +64,9 @@ CREATE INDEX IF NOT EXISTS idx_papers_status_bucket ON papers(status, bucket);
 MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("remote_only", "ALTER TABLE papers ADD COLUMN remote_only INTEGER NOT NULL DEFAULT 0"),
     ("bucket", "ALTER TABLE papers ADD COLUMN bucket INTEGER NOT NULL DEFAULT -1"),
+    ("converter", "ALTER TABLE papers ADD COLUMN converter TEXT"),
+    ("upgrade_attempts",
+     "ALTER TABLE papers ADD COLUMN upgrade_attempts INTEGER NOT NULL DEFAULT 0"),
 )
 
 _ROW_COLUMNS = (
@@ -132,6 +137,9 @@ class TaskResult:
     count_attempt: bool = False
     worker_id: int = 0        # pid of the process that handled it; for checkpoints
     converter: str = ""       # the backend that actually produced it, fallback included
+    # A fallback-converted paper the primary converter failed on again. The row stays
+    # exactly as it was -- `done`, with its fallback output -- and only the try is counted.
+    upgrade_failed: bool = False
 
 
 def _utcnow() -> str:
@@ -354,6 +362,54 @@ class Manifest:
             )
             return [PaperRow(**dict(r)) for r in cur.fetchall()]
 
+    def upgrade_candidates(
+        self, fallback: str, *, max_attempts: int | None = None
+    ) -> list[str]:
+        """Ids of finished papers this device converted with the `fallback` backend.
+
+        `converter` is only ever written by the device that did the conversion; a paper
+        marked done from the bucket has NULL there. So across a fleet each paper is a
+        candidate on exactly one machine, and no two devices re-convert the same one --
+        without anything having to be coordinated at run time. Deliberately not filtered
+        by the device slice: a reallocation moves slices, not authorship.
+        """
+        ceiling = "" if max_attempts is None else " AND upgrade_attempts < ?"
+        params: tuple = (DONE, fallback) if max_attempts is None else (DONE, fallback, max_attempts)
+        return [r[0] for r in self.conn.execute(
+            f"SELECT arxiv_id FROM papers WHERE status = ? AND converter = ?{ceiling}", params
+        )]
+
+    def rows_for_upgrade(self, ids: list[str], fallback: str) -> list[PaperRow]:
+        """The rows for `ids`, read without claiming them.
+
+        An upgrade never leaves `done`: the paper *is* done, and a crash mid-upgrade must
+        not hand it to `reset_stale` and from there back to `pending`. The converter is
+        re-checked so an id whose row moved on since the snapshot is quietly dropped.
+        """
+        if not ids:
+            return []
+        slots = ", ".join("?" * len(ids))
+        cur = self.conn.execute(
+            f"SELECT {', '.join(_CLAIM_COLUMNS)} FROM papers "
+            f"WHERE arxiv_id IN ({slots}) AND status = ? AND converter = ?",
+            (*ids, DONE, fallback),
+        )
+        return [PaperRow(**dict(r)) for r in cur.fetchall()]
+
+    def record_converters(self, pairs: Iterable[tuple[str, str]]) -> int:
+        """Fill in `converter` for finished rows that do not have one. Returns rows set.
+
+        For manifests that predate the column: the backend is recoverable from the log or
+        from each paper's front matter, and this is where either source lands.
+        """
+        with self.conn:
+            cur = self.conn.executemany(
+                "UPDATE papers SET converter = ? "
+                "WHERE arxiv_id = ? AND status = ? AND converter IS NULL",
+                [(name, arxiv_id, DONE) for arxiv_id, name in pairs],
+            )
+        return cur.rowcount
+
     def reset_stale(self) -> int:
         """Return rows abandoned `in_flight` by a crashed run back to `pending`."""
         with self.conn:
@@ -558,7 +614,8 @@ class ManifestWriter(threading.Thread):
               low_text     = :low_text,
               remote_only  = :remote_only,
               attempts     = attempts + :count_attempt,
-              completed_at = :completed_at
+              completed_at = :completed_at,
+              converter    = COALESCE(NULLIF(:converter, ''), converter)
             WHERE arxiv_id = :arxiv_id
         """
         # Built explicitly rather than from asdict(), so a new TaskResult field cannot
@@ -571,7 +628,15 @@ class ManifestWriter(threading.Thread):
             "low_text": int(r.low_text), "remote_only": int(r.remote_only),
             "count_attempt": int(r.count_attempt),
             "completed_at": _utcnow() if r.status in (DONE, NO_PDF) else None,
-        } for r in results]
+            "converter": r.converter or "",
+        } for r in results if not r.upgrade_failed]
+        # Kept out of the statement above on purpose: that one rewrites status, sizes and
+        # flags, and a failed upgrade must leave all of them describing the fallback output
+        # that is still in place.
+        failed_upgrades = [(r.arxiv_id,) for r in results if r.upgrade_failed]
         with conn:
             conn.executemany(sql, payload)
-        self.applied += len(payload)
+            conn.executemany(
+                "UPDATE papers SET upgrade_attempts = upgrade_attempts + 1 "
+                "WHERE arxiv_id = ?", failed_upgrades)
+        self.applied += len(results)

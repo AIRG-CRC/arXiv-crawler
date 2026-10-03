@@ -275,7 +275,7 @@ def _pipeline_cfg(tmp_path, monkeypatch, converted):
         converted.append(row.arxiv_id)
         return TaskResult(arxiv_id=row.arxiv_id, status=DONE, md_bytes=10, n_pages=1,
                           n_tables=0, n_chars=10, count_attempt=True, worker_id=1,
-                          converter="pymupdf")
+                          converter=convert_cfg.converter)
 
     monkeypatch.setattr(C, "convert_and_write", convert)
     return cfg, C

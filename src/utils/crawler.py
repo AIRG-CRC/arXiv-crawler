@@ -607,6 +607,28 @@ def run_pipeline(
         retry_ids = manifest.claimable_ids(
             RETRYABLE, max_attempts=max_attempts, partition=partition)
 
+    # Papers this device converted with the fallback, to be re-converted with the primary
+    # backend. A snapshot for the same reason as the retry worklist; see
+    # Manifest.upgrade_candidates for why no other device will pick the same papers.
+    primary = cfg.convert.converter
+    fallback = getattr(cfg.convert, "fallback_converter", None)
+    upgrade_ids: list[str] = []
+    if getattr(cfg.convert, "upgrade_fallbacks", True) and fallback and fallback != primary:
+        # Manifests from before the `converter` column learn it from the log, once.
+        from .upgrade import scan_log
+
+        try:
+            learnt = scan_log(manifest, cfg.paths.logs_dir / "crawler.log",
+                              cfg.paths.manifest_db.with_suffix(".logscan.json"))
+            if learnt:
+                console("  %s earlier fallback conversion(s) identified from the log",
+                        f"{learnt:,}")
+        except Exception:                       # noqa: BLE001 - a convenience, never fatal
+            log.exception("log scan for earlier fallbacks failed")
+        upgrade_ids = manifest.upgrade_candidates(
+            fallback, max_attempts=getattr(cfg.convert, "upgrade_max_attempts", 3))
+    upgrading: set[str] = set()         # ids dispatched as upgrades and not yet recorded
+
     stats = manifest.stats()
     # `stats` stays whole-corpus, because that is what the bar measures. What is left *for
     # this device*, though, is the partitioned count -- using the corpus figure would set
@@ -615,7 +637,7 @@ def run_pipeline(
     if partition:
         console("device %s — %s paper(s) pending in this slice",
                 describe_partition(partition), f"{pending_here:,}")
-    remaining = pending_here + len(retry_ids)
+    remaining = pending_here + len(retry_ids) + len(upgrade_ids)
     todo = min(remaining, limit) if limit else remaining
     if not todo:
         stuck = manifest.count_claimable(RETRYABLE, partition=partition) - len(retry_ids)
@@ -642,6 +664,11 @@ def run_pipeline(
                  len(retry_ids), total_failed, max_attempts)
     else:
         console("retry: no failed papers to retry")
+
+    if upgrade_ids:
+        console("upgrade: %s paper(s) converted by '%s' here will be re-converted with "
+                "'%s' and replaced in place", f"{len(upgrade_ids):,}", fallback, primary)
+        log.info("upgrade pass: %d paper(s) from %s to %s", len(upgrade_ids), fallback, primary)
 
     stuck = total_failed - len(retry_ids)
     if stuck > 0:
@@ -781,8 +808,37 @@ def run_pipeline(
         in_run_used[row.arxiv_id] = used + 1
         return True
 
+    def _record_upgrade(result: TaskResult) -> None:
+        """Close out a re-conversion. Either way the paper stays `done`.
+
+        Off the main bar and out of the Done/Fail tallies: those count papers reaching the
+        corpus, and this one was already in it.
+        """
+        upgrading.discard(result.arxiv_id)
+        if result.status == DONE:
+            writer.submit(result)
+            tallies["upgraded"] = tallies.get("upgraded", 0) + 1
+            console("  ⇧ %s re-converted with '%s' (was '%s')",
+                    result.arxiv_id, result.converter or primary, fallback)
+        else:
+            writer.submit(TaskResult(arxiv_id=result.arxiv_id, status=DONE,
+                                     upgrade_failed=True))
+            tallies["upgrade_failed"] = tallies.get("upgrade_failed", 0) + 1
+            error = " ".join((result.error or result.status).split())
+            console("  ↳ %s keeps its '%s' output — '%s' failed again: %s",
+                    result.arxiv_id, fallback, primary,
+                    error if len(error) <= 160 else error[:157] + "...")
+            log.warning("upgrade of %s failed: %s", result.arxiv_id, result.error)
+        if result.worker_id:
+            bars.bump(result.worker_id, result.arxiv_id)
+        _refresh_postfix()
+        bar.update(0)
+
     def _record(result: TaskResult, row: PaperRow | None = None) -> None:
         nonlocal consecutive_fallbacks, fallback_alarm_raised
+        if result.arxiv_id in upgrading:
+            _record_upgrade(result)
+            return
         if result.status not in (DONE, NO_PDF) and row is not None \
                 and _try_again_this_run(row, result):
             # Record the attempt and its error, but leave the row `in_flight` and hand it
@@ -878,6 +934,16 @@ def run_pipeline(
             rows += claimed
             want -= len(claimed)
             fresh_dispatched += len(claimed)
+        if want > 0 and upgrade_ids:
+            head = upgrade_ids[:want]
+            del upgrade_ids[:want]
+            picked = manifest.rows_for_upgrade(head, fallback)
+            upgrading.update(r.arxiv_id for r in picked)
+            rows += picked
+            want -= len(picked)
+            # Counted against `--limit` by the ids taken off the worklist, not the rows
+            # that survived the re-check, so `todo` is always reached.
+            fresh_dispatched += len(head)
         if want > 0:
             batch = manifest.claim_batch(want, partition=partition)
             rows += batch
@@ -1068,6 +1134,10 @@ def run_pipeline(
                     if outcome.status == PENDING:
                         # Interrupted before it started: requeue silently, and do not
                         # let it count towards progress or the checkpoint tallies.
+                        if row.arxiv_id in upgrading:
+                            # Still `done`, still a candidate next run: nothing to write.
+                            upgrading.discard(row.arxiv_id)
+                            continue
                         writer.submit(TaskResult(arxiv_id=row.arxiv_id, status=PENDING))
                         continue
                     if outcome.status != DONE:
@@ -1082,6 +1152,7 @@ def run_pipeline(
                         base_url=cfg.crawl.base_url,
                         pdf_bytes=outcome.size, pdf_sha256=outcome.sha256,
                         keep_pdf=keep_pdf, minio=minio_settings,
+                        upgrade=row.arxiv_id in upgrading,
                     )
                     conversions[submitted] = row
                     started_at[submitted] = time.monotonic()

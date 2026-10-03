@@ -157,6 +157,10 @@ class Convert:
     # Tried when `converter` fails or times out on a paper. null disables it, and the
     # paper is then recorded as failed_convert exactly as before.
     fallback_converter: str | None = "pymupdf"
+    # Re-convert, at the start of a run, papers this device earlier converted with the
+    # fallback. `upgrade_max_attempts` bounds the tries per paper; None means no bound.
+    upgrade_fallbacks: bool = True
+    upgrade_max_attempts: int | None = 3
     # Recycle a conversion worker after this many papers, so any growth the per-paper
     # heap release cannot reclaim is bounded by construction. Costs one model reload.
     # null keeps workers for the whole run.
@@ -207,6 +211,8 @@ class Minio:
     secure: bool = False           # the endpoint above is plain HTTP
     access_key: str | None = None
     secret_key: str | None = None
+    # Tries per object before an upload counts as failed. Each retry uses a new connection.
+    upload_attempts: int = 4
 
 
 @dataclass

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,8 +35,25 @@ SECRET_KEY_ENV = "MINIO_SECRET_KEY"
 KINDS = ("md", "tables", "meta")
 
 
+# A pooled connection that has sat unused this long is closed before the next upload
+# rather than trusted. A docling conversion runs for minutes between a worker's uploads,
+# and a keep-alive socket left idle that long is routinely half-dead by the time it is
+# reused: the request goes out, the body does not all arrive, and MinIO answers
+# `IncompleteBody`. Reconnecting costs a handshake on a LAN.
+IDLE_RECONNECT_SECONDS = 20.0
+
+
 class ObjectStoreError(RuntimeError):
     pass
+
+
+class UploadError(ObjectStoreError):
+    """An artefact could not be stored after every attempt.
+
+    Its own type so the conversion worker can tell "the bucket refused this" from "the
+    converter failed": the first says nothing about the backend that produced the file,
+    and must not send the paper to the fallback converter.
+    """
 
 
 def object_name(kind: str, arxiv_id: str, *, prefix: str = "") -> str:
@@ -124,6 +142,7 @@ class MinioSettings:
     secure: bool = False
     access_key: str | None = None
     secret_key: str | None = None
+    upload_attempts: int = 4
 
     @classmethod
     def from_config(cls, cfg: Any) -> "MinioSettings":
@@ -141,6 +160,7 @@ class MinioSettings:
             secure=bool(getattr(cfg, "secure", False)),
             access_key=access,
             secret_key=secret,
+            upload_attempts=max(int(getattr(cfg, "upload_attempts", 4) or 1), 1),
         )
 
     def validate(self) -> None:
@@ -169,6 +189,24 @@ class MinioStore:
         self.settings = settings
         self._client = client          # injectable, which is what makes this testable
         self._bucket_checked = client is not None
+        self._last_used = time.monotonic()
+
+    def reset(self) -> None:
+        """Close every pooled connection, so the next request opens a fresh one."""
+        pool = getattr(self._client, "_http", None)
+        clear = getattr(pool, "clear", None)
+        if clear is not None:
+            try:
+                clear()
+            except Exception:           # noqa: BLE001 - a failed close is not a failure
+                log.debug("could not clear the connection pool", exc_info=True)
+
+    def _fresh_connection(self) -> None:
+        """Drop connections that have been idle long enough to be suspect."""
+        now = time.monotonic()
+        if now - self._last_used > IDLE_RECONNECT_SECONDS:
+            self.reset()
+        self._last_used = now
 
     @property
     def client(self) -> Any:
@@ -205,8 +243,10 @@ class MinioStore:
 
     def put_file(self, local_path: Path, name: str) -> int:
         """Upload one file. Returns the byte count sent."""
+        self._fresh_connection()
         self.ensure_bucket()
         self.client.fput_object(self.settings.bucket, name, str(local_path))
+        self._last_used = time.monotonic()
         return local_path.stat().st_size
 
     def put_bytes(self, name: str, payload: bytes, content_type: str = "text/markdown") -> int:
@@ -234,11 +274,23 @@ class MinioStore:
                 if closer is not None:
                     closer()
 
+    def get_head(self, name: str, length: int) -> bytes:
+        """The first `length` bytes of an object -- enough for a front matter block."""
+        response = self.client.get_object(self.settings.bucket, name, offset=0, length=length)
+        try:
+            return response.read()
+        finally:
+            for method in ("close", "release_conn"):
+                closer = getattr(response, method, None)
+                if closer is not None:
+                    closer()
+
     def remove_object(self, name: str) -> bool:
         """Delete one object. True if it was there, False if it already was not.
 
-        Deliberately narrow: the only thing that deletes here is retiring a device's marker,
-        and the corpus itself is never removed by this code. A missing object is success --
+        Deliberately narrow. Two things delete: retiring a device's marker, and a
+        re-conversion dropping a tables object its new output has no tables for. Nothing
+        else in the corpus is ever removed by this code. A missing object is success --
         retiring a machine twice should not be an error.
         """
         if not self.exists(name):
@@ -304,13 +356,34 @@ class MinioStore:
         return where + (f"/{self.settings.prefix.strip('/')}" if self.settings.prefix else "")
 
 
-def upload_and_unlink(store: MinioStore, local_path: Path, name: str) -> int:
+def upload_and_unlink(
+    store: MinioStore, local_path: Path, name: str, *, sleep: Any = time.sleep
+) -> int:
     """Upload one artefact and remove the local copy once the upload has returned.
 
     The unlink is deliberately *after* a successful `put`: an upload that throws leaves
     the file on disk, where the next `dump` will find it. Losing the only copy because
     the network blinked is the one failure this ordering rules out.
+
+    A failed upload is retried on a fresh connection, `settings.upload_attempts` times in
+    all with a short backoff. The object is written whole or not at all, so repeating a
+    put is safe. Only when every attempt fails does this raise, and then as `UploadError`.
     """
-    size = store.put_file(local_path, name)
-    local_path.unlink(missing_ok=True)
-    return size
+    attempts = max(int(getattr(store.settings, "upload_attempts", 4) or 1), 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            size = store.put_file(local_path, name)
+        except Exception as exc:        # noqa: BLE001 - S3Error, urllib3, OSError alike
+            store.reset()
+            if attempt == attempts:
+                raise UploadError(
+                    f"{name} not stored after {attempts} attempt(s): "
+                    f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"
+                ) from exc
+            log.warning("upload of %s failed (attempt %d of %d): %s: %s",
+                        name, attempt, attempts, type(exc).__name__, exc)
+            sleep(min(2.0 ** (attempt - 1), 15.0))
+        else:
+            local_path.unlink(missing_ok=True)
+            return size
+    raise AssertionError("unreachable")

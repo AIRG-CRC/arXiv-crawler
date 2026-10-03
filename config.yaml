@@ -75,6 +75,12 @@ convert:
   # The backend that actually ran is recorded in each paper's markdown front matter.
   # Set to null to disable and record such papers as failed_convert instead.
   fallback_converter: pymupdf
+  # Papers this device converted with the fallback are re-converted with `converter` at the
+  # start of later runs and written over the same objects in the bucket, so nothing is
+  # duplicated. A paper the primary converter fails on again keeps its fallback output;
+  # after `upgrade_max_attempts` such tries it is left alone (null = keep trying forever).
+  upgrade_fallbacks: true
+  upgrade_max_attempts: 3
   # --- memory ---
   # A docling worker's heap climbs ~0.3 GB per paper and never comes back on its own:
   # glibc keeps the freed arenas rather than returning them. The worker now calls
@@ -123,6 +129,10 @@ minio:
   secure: false # the endpoint above is plain HTTP
   access_key: null
   secret_key: null
+  # Tries per object before an upload counts as failed; each retry opens a new connection.
+  # An upload that still fails is recorded as an upload failure -- it never sends the
+  # paper to the fallback converter, and the files stay on disk for `dump`.
+  upload_attempts: 4
 
 # Reconciling with the bucket before a run, so two devices never convert the same paper.
 #

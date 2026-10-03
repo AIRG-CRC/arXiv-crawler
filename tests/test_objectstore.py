@@ -56,10 +56,11 @@ class FakeClient:
         self.calls.append(("put", name))
         self.objects[name] = data.read()
 
-    def get_object(self, bucket, name):
+    def get_object(self, bucket, name, offset=0, length=0):
         if name not in self.objects:
             raise RuntimeError("not found")
-        return _FakeResponse(self.objects[name])
+        payload = self.objects[name]
+        return _FakeResponse(payload[offset:offset + length] if length else payload)
 
     def stat_object(self, bucket, name):
         if name not in self.objects:
@@ -174,7 +175,7 @@ def test_a_failed_upload_leaves_the_file_on_disk(tmp_path):
     local.write_text("body")
 
     with pytest.raises(RuntimeError):
-        upload_and_unlink(store, local, "arxiv/md/2301/paper.md")
+        upload_and_unlink(store, local, "arxiv/md/2301/paper.md", sleep=lambda s: None)
 
     assert local.exists() and local.read_text() == "body"
 

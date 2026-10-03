@@ -943,6 +943,24 @@ def _worker_uploader(minio_cfg: Any, arxiv_id: str) -> Any:
     return upload
 
 
+def _worker_remover(minio_cfg: Any, arxiv_id: str) -> Any:
+    """A `remove(kind)` callback for one paper's stored artefact, or None when local.
+
+    Only a re-conversion needs it: the new output replaces the old objects name for name,
+    except a tables file the new backend has no content for -- that one would otherwise
+    stay behind in the bucket, describing a conversion that no longer exists.
+    """
+    if not minio_cfg:
+        return None
+    _worker_uploader(minio_cfg, arxiv_id)       # builds and caches the store
+    store = _STORE_CACHE["minio"]
+
+    def remove(kind: str) -> None:
+        store.remove_object(store.name_for(kind, arxiv_id))
+
+    return remove
+
+
 def _worker_converter(name: str, cfg: Any) -> BaseConverter:
     """One converter instance per worker process, built lazily and reused."""
     conv = _WORKER_CACHE.get(name)
@@ -1096,24 +1114,37 @@ def convert_and_write(
     pdf_sha256: str | None = None,
     keep_pdf: bool = False,
     minio: dict[str, Any] | None = None,
+    upgrade: bool = False,
 ) -> Any:
     """Convert one staged PDF, write the outputs, drop the PDF. Returns a `TaskResult`.
 
     Tries `convert.converter`, then `convert.fallback_converter` if the first one fails.
     The PDF is deleted once, after every attempt, so the fallback still has an input.
+
+    `upgrade` re-converts a paper that already has fallback output: only the primary
+    backend is tried -- the fallback's result is what is being replaced, so falling back
+    again would just rewrite it -- and nothing is written unless that backend succeeds.
+
+    A failed *upload* is not a failed conversion. It ends the paper with the error named as
+    such and never moves on to the next backend: the output was fine, the bucket was not,
+    and re-converting with a plainer backend would store a worse paper for no reason.
     """
     import os
 
     worker_id = os.getpid()
 
+    from .objectstore import UploadError
     from .state import DONE, FAILED_CONVERT, TaskResult
     from .writer import write_outputs
 
     log_ = logging.getLogger(__name__)
     errors: list[str] = []
+    chain = _converter_chain(convert_cfg)
+    if upgrade:
+        chain = [(chain[0][0], True)]
 
     try:
-        for name, is_last in _converter_chain(convert_cfg):
+        for name, is_last in chain:
             try:
                 result = _convert_with_deadline(name, pdf_path, convert_cfg)
 
@@ -1131,6 +1162,7 @@ def convert_and_write(
                     converter=name,
                     base_url=base_url,
                     upload=_worker_uploader(minio, row.arxiv_id),
+                    remove=_worker_remover(minio, row.arxiv_id) if upgrade else None,
                 )
                 if errors:
                     log_.warning("%s converted by fallback %s after: %s",
@@ -1146,6 +1178,16 @@ def convert_and_write(
                     # run-minio corpus as missing, and `--fix` re-queues the lot.
                     remote_only=bool(minio),
                     count_attempt=True, worker_id=worker_id, converter=name,
+                )
+
+            except UploadError as exc:
+                log_.error("upload failed: %s (converted by %s)", row.arxiv_id, name,
+                           exc_info=exc)
+                return TaskResult(
+                    arxiv_id=row.arxiv_id, status=FAILED_CONVERT,
+                    error=join_backend_errors(errors + [f"upload: {exc}"]),
+                    pdf_bytes=pdf_bytes, pdf_sha256=pdf_sha256,
+                    count_attempt=True, worker_id=worker_id,
                 )
 
             except BaseException as exc:  # noqa: BLE001 - recorded, never raised
