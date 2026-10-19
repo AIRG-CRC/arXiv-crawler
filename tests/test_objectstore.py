@@ -73,6 +73,7 @@ class FakeClient:
 
     def list_objects(self, bucket, prefix=None, recursive=False, start_after=None):
         self.listings.append(prefix)
+        seen: set[str] = set()
         # Sorted, because that is the ordering real S3 listings guarantee and the one the
         # prefix and start_after logic is written against.
         for name in sorted(self.objects):
@@ -80,6 +81,16 @@ class FakeClient:
                 continue
             if start_after and name <= start_after:
                 continue
+            if not recursive:
+                # One level only, the way S3 answers a delimited listing: anything deeper is
+                # folded into its common prefix, reported once with a trailing slash.
+                rest = name[len(prefix or ""):]
+                if "/" in rest:
+                    folder = (prefix or "") + rest.split("/", 1)[0] + "/"
+                    if folder not in seen:
+                        seen.add(folder)
+                        yield FakeObject(folder, 0, None)
+                    continue
             yield FakeObject(name, len(self.objects[name]), self.modified.get(name))
 
 

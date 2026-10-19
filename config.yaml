@@ -62,7 +62,7 @@ convert:
   # context. Measured on this machine: ~2.0 GB VRAM and ~3.7 GB RAM per worker, so on
   # 16 GB of VRAM / 32 GB of RAM the ceiling is ~6 and 4 leaves comfortable headroom.
   # Only relevant for model backends -- pymupdf is CPU-only and wants workers ~= cores.
-  workers: 4
+  workers: 6
   device: auto # auto | cpu | cuda — pin it to catch a silent fall back to CPU
   num_threads: null # CPU threads per worker; null derives cores // workers
   # docling's text backend. Leave on pypdfium: docling's own "docling_parse" default
@@ -123,7 +123,7 @@ retry:
 # Credentials are NOT set here — this file is tracked in git. Export them instead:
 #   export MINIO_ACCESS_KEY=...  MINIO_SECRET_KEY=...
 minio:
-  endpoint: 10.3.18.40:9000
+  endpoint: 10.3.67.40:9000
   bucket: airg
   prefix: arxiv
   secure: false # the endpoint above is plain HTTP
@@ -152,8 +152,10 @@ sync:
   devices: null # how many machines share this corpus; null or 1 means just this one
   device_index: null # which slice this machine takes, 0-based, up to devices - 1
   # The bucket can hold the authoritative split at <prefix>/_state/partition.json, so the
-  # device count is changed once for the whole fleet rather than on every machine:
-  #   python -m src.main devices --set-devices 4 --auto
+  # shares are changed once for the whole fleet rather than on every machine:
+  #   python -m src.main devices --share DGX-1=60 --share DGX-2=40   # relative weights
+  #   python -m src.main devices --share DGX-3=0                     # park a machine
+  #   python -m src.main devices --auto                              # equal shares
   # When that plan names this device it overrides `devices`/`device_index` above. Set this
   # to false to pin this machine to its own values whatever the plan says.
   follow_plan: true
@@ -161,6 +163,13 @@ sync:
   on_start: true # sync automatically at the start of `run-minio`
   marker: true # publish <prefix>/_state/sync/<device>.json after each sync
   heartbeat_seconds: 60 # how often a running crawl republishes its progress; 0 disables
+  # A running crawl also re-reads the shared allocation on every heartbeat, so a share set
+  # with `devices --share` takes effect within that interval, without a restart.
+  #
+  # The start-of-run sync reads each device's done-journal (_state/done/<device>/) rather
+  # than listing the whole bucket, so it takes seconds. `sync --full` still runs the listing.
+  check_before_download: true # HEAD the bucket before each download, to skip finished papers
+  scan_threads: 8 # parallel shard listings for `sync --full`
 
 postgres:
   dsn: null # e.g. "postgresql://user:pass@localhost:5432/arxiv"

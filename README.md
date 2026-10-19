@@ -302,7 +302,7 @@ stop refusing it — a restart wrapper must treat 75 as "wait", not "try again n
 
 ```bash
 python -m src.main run-minio [same flags as run]
-python -m src.main sync [--dry-run] [--devices N] [--device-index I] [--force]
+python -m src.main sync [--dry-run] [--full] [--devices N] [--device-index I] [--force]
 python -m src.main dump [--keep-local] [--skip-existing] [--limit N] [--dry-run]
 python -m src.main test-paper <id> [--converter NAME] [--minio] [--show N]
 ```
@@ -314,8 +314,8 @@ paper through the whole path without touching the manifest. See
 
 ```bash
 python -m src.main devices      # what every machine sharing the bucket is doing
-python -m src.main devices --set-devices N --auto   # reallocate the whole fleet in one write
-python -m src.main devices --assign NAME=INDEX      # place one machine by hand
+python -m src.main devices --share DGX-1=60 --share DGX-2=40   # set shares; live in ~60s
+python -m src.main devices --auto                  # equal shares for every reporting machine
 python -m src.main devices --auto --forget NAME    # retire a machine and re-divide
 python -m src.main status       # counts by status, output size, tables extracted, last sync
 python -m src.main verify       # cross-check the manifest against files on disk
@@ -586,107 +586,75 @@ locally — nothing already converted is ever crawled again.
 
 **Both devices would otherwise claim the same papers.** `claim_batch` is atomic within one SQLite
 file, and there are two files. So the queue is split by `crc32(arxiv_id) % 256`, and each device
-claims only its own residue class. No coordination, no leases, no shared database.
+claims only its own contiguous range of those 256 buckets. No coordination, no leases, no
+shared database.
 
-### Changing the number of machines
+### Setting each machine's share
 
-The split is computed per claim — `bucket % devices == index` — so **nothing is stored that
-needs migrating.** Change the count and the next run reallocates by arithmetic. Work already done
-stays done; papers a machine no longer owns simply get claimed by whichever machine now owns them.
-
-The only thing that needs agreeing is the count itself, and that lives in the bucket:
+Each machine owns a contiguous range of the 256 buckets, sized by a **relative weight**, and
+the allocation lives in the bucket at `<prefix>/_state/partition.json`. Set it from any machine:
 
 ```bash
-python -m src.main devices --set-devices 4 --auto
+python -m src.main devices --share DGX-1=60 --share DGX-2=40
 ```
 
-`--auto` assigns every machine that has reported, plus this one, to a slice in name order, and
-writes `<prefix>/_state/partition.json`. **Every machine adopts it at its next run** — no
-per-machine edits, and a machine you forget about cannot end up on the wrong slice:
-
 ```
-allocation written to http://10.3.18.40:9000/airg/arxiv/_state/partition.json
+allocation written to http://10.3.67.40:9000/airg/arxiv/_state/partition.json
 
-  4 device(s), set by mac-studio at 2026-09-24T03:42:31+00:00
-    slice 1 of 4  CIT
-    slice 2 of 4  linux-box
-    slice 3 of 4  mac-studio
-    slice 4 of 4  thinkpad
+  2 device(s), set by DGX-1 at 2026-10-20T03:42:31+00:00
+     60.2%  DGX-1                buckets 0-153  (weight 60)
+     39.8%  DGX-2                buckets 154-255  (weight 40)
 
-every machine picks this up at its next run — no per-machine edits.
+running crawls switch within ~60s; stopped machines pick it up when they next start — no per-machine edits.
 ```
 
-Each run then says which slice it took and whether that changed:
+- Only the ratio matters: `60/40`, `3/2` and `1.5/1` are the same split. Machines you do not
+  name keep their weight, so `--share DGX-1=80` alone changes just that one.
+- `--share NAME=0` parks a machine without forgetting it. A parked run idles until it is given
+  a share again.
+- `--dry-run` prints the allocation a change would produce and writes nothing.
+- `--auto` gives every machine that has reported, plus this one, an equal share.
+
+**Running crawls switch live.** Each heartbeat (`sync.heartbeat_seconds`, 60 s by default)
+re-reads the allocation. When this machine's range has changed, the run says so, reads the
+done-journals to catch up on its new buckets, and claims from the new range from then on:
 
 ```
-allocation: slice 3 of 4, from the shared plan set by mac-studio
-allocation changed since the last run here: slice 1 of 2 → slice 3 of 4
-  (the split is recomputed per claim; nothing needs migrating)
+allocation changed: now buckets 0-76 (30.1%)
 ```
 
-To place a machine by hand, or to add one the plan does not know about:
-
-```bash
-python -m src.main devices --assign thinkpad=3
-```
+Papers already in flight from a range a machine just lost are finished where they are. The new
+owner checks the bucket before each download, so it skips any that land first; at worst a
+handful get converted twice and overwritten in place. Moving shares only slides the range
+boundaries, so going from 50/50 to 60/40 hands over 10% of the corpus, not most of it.
 
 **To retire a machine for good**, forget it. That deletes its marker *and* drops it from the
-allocation, and the rest are reindexed contiguously:
+allocation:
 
 ```bash
 python -m src.main devices --auto --forget mac-studio --forget old-laptop
 ```
 
 Deleting the marker is the part that matters. `--auto` rebuilds the fleet from the markers, so a
-retired machine whose marker survives comes straight back on the next `--auto` — remove two
-machines one at a time with `--unassign` and you will watch each one undo the other. `--forget`
-ends that. It refuses to forget the machine you are running it from, so run it from one that is
-staying.
-
-**`--unassign` is the other half:** it drops a machine from the allocation but keeps its marker,
-for one that is only away for a while. On its own it does *not* reallocate — the count stays put
-and that slice is crawled by nobody until something takes it, which `devices` then reports as a
-problem. Pair it with `--auto` to re-divide, or with `--set-devices` to set the count yourself:
-
-```bash
-python -m src.main devices --set-devices 3 --unassign mac-studio    # exact, no reindexing
-python -m src.main devices --auto --unassign mac-studio             # re-derive from markers
-```
-
-Lowering the count on its own cannot work: whoever held the top slice would be left pointing at a
-slice that no longer exists, so `--set-devices 3` alone is refused with the two commands that fix
-it.
-
-```
-  3 device(s), set by CIT at 2026-09-24T03:48:17+00:00
-    slice 1 of 3  CIT
-    slice 2 of 3  gx10-df62
-    slice 3 of 3  linux-box
-```
-
-A machine already running keeps the split it started with, so **stop the machine you removed** —
-and stop or restart the others when convenient. Nothing is lost if you don't: the three remaining
-slices still cover the whole corpus, so no paper is stranded.
+retired machine whose marker survives comes straight back on the next `--auto`. `--forget` ends
+that. It refuses to forget the machine you are running it from, so run it from one that is
+staying. `--unassign NAME` drops a machine from the allocation but keeps its marker. Its buckets
+are crawled by nobody until you re-divide (`--auto`, or `--share` for the others), and `devices`
+reports that gap as a problem.
 
 **One rule makes the rest predictable:** a machine that follows a plan which splits the corpus
-must be named in it. A machine you dropped and then restarted refuses rather than re-crawling a
-slice the others already cover — silent duplication for hours is much worse than an error you fix
-in one command. `sync.follow_plan: false` is the deliberate way out.
+must be named in it. A machine you dropped and then restarted refuses to start rather than
+re-crawling a range the others already cover. `sync.follow_plan: false` is the deliberate way
+out.
 
 The plan **overrides** `sync.devices` / `sync.device_index` and the environment, because a machine
-with a stale local count is exactly what it exists to prevent. A `--devices` flag still wins, for a
-one-off run, and `sync.follow_plan: false` pins a machine to its own settings. A machine the plan
-splits away from but never names **refuses to start** rather than defaulting to slice 0 and
-silently duplicating whoever owns it.
+with a stale local count is exactly what it exists to prevent. A `--devices` / `--device-index`
+flag still wins, for a one-off run, and pins that run: it does not follow live changes.
 
-`devices` tells a rollout apart from a fault. A machine that is stopped and will adopt the new
-split gets a `·` notice; one that is *crawling the wrong slice right now* gets a `⚠` and exit 1:
-
-```
-  · 'mac-studio' last ran on slice 1 of 2; it will pick up slice 3 of 3 when it next starts
-  ⚠ 'linux-box' is crawling slice 2 of 2 right now, but the allocation puts it on slice 2 of 3
-    — it is on the wrong slice until it restarts
-```
+`devices` tells a rollout apart from a fault. A stopped machine that will adopt the new split gets
+a `·` notice. A machine still *crawling another range right now* gets a `⚠` and exit 1. That is
+normal for up to one heartbeat after a change. If it persists, that machine runs an older version
+and needs a restart.
 
 ### Setting it up
 
@@ -726,12 +694,31 @@ python -m src.main run-minio
 which opens with something like:
 
 ```
-storing to http://10.3.18.40:9000/airg/arxiv
-  scanned 184 shard(s), skipped 41 already complete
-  218,431 object(s) listed in 47.3s
-  marked 1,204 paper(s) done from the bucket
-device slice 1 of 2 — 1,243,905 paper(s) pending in this slice
+storing to http://10.3.67.40:9000/airg/arxiv
+allocation: buckets 0-153 (60.2%), from the shared plan set by DGX-1
+  journal: 14 new segment(s) from 1 device(s), 1,204,377 id(s), in 6.2s
+  marked 1,204 paper(s) done from the journal
+device buckets 0-153 (60.2%) — 1,243,905 paper(s) pending in this slice
 ```
+
+### Why the start is fast
+
+The start-of-run sync used to list every md and meta object in the bucket, which took hours on a
+bucket of millions of objects. Now each machine publishes a **done-journal**: gzip'd lists of the
+papers it finished, under `<prefix>/_state/done/<device>/`. At start, each machine reads only the
+journal segments the others have written since it last looked. The first run with this version
+publishes a snapshot of everything its manifest knows is done, which bootstraps the rest of the
+fleet. After that, finished papers are published every heartbeat.
+
+Two safety nets cover anything the journal has not seen, such as objects uploaded by a machine
+that never ran this version:
+
+- `sync.check_before_download: true` checks the bucket for each paper's md and meta before
+  downloading it, and skips the paper if both are there. That is one HEAD request to MinIO on the
+  LAN per paper, which costs nothing next to arXiv's one-request-a-second limit.
+- `sync --full` still runs the full bucket listing, with `sync.scan_threads` shards in parallel.
+  It resumes where it stopped if interrupted. Run it once if you need the manifest reconciled
+  against everything in the bucket.
 
 ### Checking it is working
 
@@ -1037,10 +1024,10 @@ attempts back into the queue:
 |---|---|
 | `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` | docling reached the GPU but PyTorch cannot load a cuDNN sublibrary — a broken or mismatched CUDA install, not a problem with the paper. Reproduce it in two seconds with the conv2d check below; then either fix the install or set `convert.device: cpu` on that machine. |
 | Everything `converted by fallback` | The configured converter is broken on this machine, not defeated by the papers. The run says so once after 10 consecutive fallbacks and again in the summary. For docling, a `RepositoryNotFoundError: 401` means an HF token in the environment is being sent and rejected — the model repo is public, so `unset HF_TOKEN HUGGING_FACE_HUB_TOKEN` and verify with `test-paper <id> --converter docling` before restarting. |
-| `⚠ device 'X' last ran with --devices N` | Nobody has set a shared allocation, so each machine is using its own count and they disagree. `devices --set-devices N --auto` fixes it in one write. |
+| `⚠ 'X' last ran on buckets …, which overlaps this device's …` | Nobody has set a shared allocation, so each machine is using its own count and they disagree. `devices --auto` (or `--share` per machine) fixes it in one write. |
 | `· 'X' last ran on slice … it will pick up …` | Not a problem — a stopped machine that will adopt the new allocation when it restarts. Only the `⚠` lines need action. |
-| `the shared allocation … does not name this device` | Either this machine should be in the allocation (`devices --assign <name>=<n>`, or `devices --auto`), or it was deliberately removed and should be stopped. It refuses to fall back to its own config because that would duplicate whoever now owns that share. |
-| `… is assigned a slice that does not exist` | You lowered the count without saying which machine is leaving. `devices --auto --forget <name>` retires one and reindexes the rest. |
+| `the shared allocation … does not name this device` | Either this machine should be in the allocation (`devices --share <name>=<weight>`, or `devices --auto`), or it was deliberately removed and should be stopped. It refuses to fall back to its own config because that would duplicate whoever now owns that share. |
+| `… bucket(s) … are assigned to no device` | A machine was `--unassign`ed and nobody took its range. `devices --auto`, or `--share` for the remaining machines, re-divides it. |
 | `--auto` keeps bringing back a machine you removed | Its marker is still in the bucket and `--auto` rebuilds the fleet from the markers. `--forget <name>` deletes the marker; `--unassign` alone does not. |
 | `HTTP 406` or `403`, many papers at once | arXiv is refusing this IP, not rejecting the papers. Handled automatically — see [When arXiv throttles you](#when-arxiv-throttles-you). If it keeps happening, lower `--rps`. |
 | The run exited 75 | It waited out the full cooldown ladder and arXiv never relented. Wait a few hours. Do not auto-restart on 75. |

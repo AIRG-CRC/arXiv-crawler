@@ -73,6 +73,11 @@ class Paths:
         `checkpoint --clear` command globs every *.json in that directory."""
         return self.data_dir / "sync-state.json"
 
+    @property
+    def journal_state(self) -> Path:
+        """This device's done-journal counter and its cursors into everyone else's."""
+        return self.data_dir / "sync-journal.json"
+
     def ensure(self) -> None:
         """Create every output directory"""
         for d in (
@@ -249,6 +254,12 @@ class Sync:
     # How often a running crawl republishes its marker, so `devices` on any machine shows a
     # live view. One small object per interval; 0 disables, and values below 5s are raised.
     heartbeat_seconds: int = 60
+    # Before downloading a paper, ask the bucket whether its md (and meta) is already there.
+    # The journal is what makes a start fast; this is what catches anything it has not seen
+    # yet. One LAN HEAD per paper, against arXiv's one request a second.
+    check_before_download: bool = True
+    # Listing threads for `sync --full`, the bucket-wide scan the journal replaced.
+    scan_threads: int = 8
 
 
 @dataclass

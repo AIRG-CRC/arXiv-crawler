@@ -38,6 +38,7 @@ from .converter import convert_and_write
 from .cooldown import Cooldown, looks_like_block_page
 from .logging_setup import console, quiet_worker_logging
 from .memory import MemoryGuard, human, resolve_floor
+from .partition import LiveSlice, Slice, bucket_for
 from .partition import describe as describe_partition
 from .paths import staged_pdf_path
 from .state import (
@@ -169,6 +170,10 @@ class ArxivSession:
             log.info("canary %s: host %s", canary, "answers" if ok else "refuses")
             self._probe_at, self._probe_ok = time.monotonic(), ok
             return ok
+
+
+# A download that never happened because the bucket already holds the paper.
+ALREADY_STORED = "already_stored"
 
 
 class DownloadOutcome:
@@ -496,20 +501,22 @@ class WorkerBars:
             bar.close()
 
 
-def _previous_partition(cfg: Any) -> tuple[int, int]:
-    """The split this device used last time, from its local sync marker.
+def _previous_partition(cfg: Any) -> Slice | None:
+    """The slice this device used last time, from its local sync marker.
 
-    `(1, 0)` when there is nothing to compare against, which reads as "the whole corpus" and
-    is the right answer for a first run.
+    None -- "the whole corpus" -- when there is nothing to compare against, which is the
+    right answer for a first run.
     """
+    from .sync import WHOLE, marker_range
+
     path = getattr(cfg.paths, "sync_state", None)
     if path is None or not path.exists():
-        return (1, 0)
+        return None
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-        return (int(state.get("devices") or 1), int(state.get("device_index") or 0))
+        was = marker_range(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError):
-        return (1, 0)
+        return None
+    return None if was == WHOLE else was
 
 
 def run_pipeline(
@@ -520,9 +527,10 @@ def run_pipeline(
     worker_bars: bool = False,
     retry_all: bool = False,
     to_minio: bool = False,
-    partition: tuple[int, int] | None = None,
+    partition: Slice | None = None,
     sync_bucket: bool | None = None,
     claim_any: bool = False,
+    follow_plan: bool = False,
 ) -> dict[str, int]:
     """Drive download -> convert -> manifest until the queue drains or Ctrl-C arrives.
 
@@ -531,9 +539,12 @@ def run_pipeline(
     informative set: if the converter was broken last run you find out in the first few
     seconds rather than after another hour of new downloads.
 
-    `partition` is this device's `(devices, index)` slice, or None for the whole corpus.
-    Every claim is filtered by it, so two devices running at once never hand the same paper
-    to two converters -- see utils.partition for why the key is hashed from the id.
+    `partition` is this device's `Slice` of the corpus, or None for the whole of it. Every
+    claim is filtered by it, so two devices running at once never hand the same paper to two
+    converters -- see utils.partition for why the key is hashed from the id.
+
+    `follow_plan` lets the shared allocation move that slice while the run is going: the
+    heartbeat re-reads it, and the dispatch loop re-targets itself at the next turn.
     """
     cfg.paths.ensure()
     data_dir = cfg.paths.data_dir
@@ -563,13 +574,10 @@ def run_pipeline(
     # loud is that it happened, because the numbers on the bar are about to mean something
     # different from last time and a silently halved slice looks like lost work.
     previous = _previous_partition(cfg)
-    if previous != (partition or (1, 0)):
-        now_devices, now_index = partition or (1, 0)
-        was_devices, was_index = previous
+    if previous != partition:
         console("allocation changed since the last run here: %s → %s "
                 "(the split is recomputed per claim; nothing needs migrating)",
-                f"slice {was_index + 1} of {was_devices}",
-                f"slice {now_index + 1} of {now_devices}")
+                describe_partition(previous), describe_partition(partition))
 
     # Learn what the other device has already converted, before anything is claimed. This
     # has to come before the retry snapshot and before `stats()`: a paper that failed here
@@ -579,11 +587,12 @@ def run_pipeline(
     # this write is uncontended.
     wants_sync = (getattr(getattr(cfg, "sync", None), "on_start", True)
                   if sync_bucket is None else sync_bucket)
+    journal = None
     if wants_sync and store is not None:
         from .sync import run_sync
 
         try:
-            report = run_sync(cfg, manifest, store, partition=partition)
+            report, journal = run_sync(cfg, manifest, store, partition=partition)
             for line in report.lines():
                 console("  %s", line)
         except Exception as exc:               # noqa: BLE001
@@ -592,6 +601,21 @@ def run_pipeline(
             log.warning("bucket sync skipped", exc_info=exc)
             console("  ⚠ bucket sync skipped (%s: %s) — using the local manifest only",
                     type(exc).__name__, exc)
+
+    if journal is None and store is not None:
+        # No start-of-run sync, but finished papers still go into the journal, so the other
+        # devices learn about them without a scan.
+        from .sync import DoneJournal, device_name
+
+        journal = DoneJournal(store, device_name(getattr(cfg, "sync", None)),
+                              getattr(cfg.paths, "journal_state", None))
+    sync_cfg = getattr(cfg, "sync", None)
+    check_before = store is not None and bool(getattr(sync_cfg, "check_before_download", True))
+    require_meta = bool(getattr(sync_cfg, "require_meta", True))
+    # The slice as it stands now. Fixed for the run unless `follow_plan`, in which case the
+    # heartbeat moves it and the dispatch loop below notices.
+    live = LiveSlice(partition)
+    seen_version = live.version
 
     # The retry worklist is fixed here, before anything is dispatched -- see
     # Manifest.claimable_ids for why it is a snapshot and not a repeated query.
@@ -639,7 +663,10 @@ def run_pipeline(
                 describe_partition(partition), f"{pending_here:,}")
     remaining = pending_here + len(retry_ids) + len(upgrade_ids)
     todo = min(remaining, limit) if limit else remaining
-    if not todo:
+    parked = follow_plan and partition is not None and partition.empty
+    if parked:
+        console("this device's share is 0 — waiting for `devices --share` to give it one")
+    if not todo and not parked:
         stuck = manifest.count_claimable(RETRYABLE, partition=partition) - len(retry_ids)
         log.info("nothing pending; run `prepare` first or use `retry`")
         console("nothing to do — the manifest is empty or complete."
@@ -733,7 +760,7 @@ def run_pipeline(
         readout = (f"Fail={tallies['failed']:,}, Done={tallies['done']:,}, "
                    f"Workers={_live_workers()}/{cfg.convert.workers}, "
                    f"Pending={pending_at_start - claimed_from_pending:,}")
-        if partition:
+        if live.current:
             # Everything above this describes the slice; this is the shared number. It moves
             # with our own conversions and is re-based by the next run's sync -- the other
             # devices' work in between is not visible until then, by design.
@@ -858,6 +885,8 @@ def run_pipeline(
         tallies["processed"] += 1
         if result.status == DONE:
             tallies["done"] += 1
+            if journal is not None:
+                journal.record(result.arxiv_id)
             if result.converter and result.converter != cfg.convert.converter:
                 # Worth a line: the paper is saved, but by a plainer backend than the one
                 # configured, and the difference shows up in the output.
@@ -908,7 +937,21 @@ def run_pipeline(
         _refresh_postfix()
         bar.update(1 if result.status == DONE else 0)
 
+    def _stored(arxiv_id: str) -> bool:
+        """Is this paper already finished in the bucket, by whichever device?"""
+        if not store.exists(store.name_for("md", arxiv_id)):
+            return False
+        return not require_meta or store.exists(store.name_for("meta", arxiv_id))
+
     def _download(row: PaperRow) -> tuple[PaperRow, DownloadOutcome]:
+        # On the download pool, so the HEADs never hold up dispatch. Upgrades are skipped:
+        # their objects are in the bucket by definition, and replacing them is the point.
+        if check_before and row.arxiv_id not in upgrading and not stop.is_set():
+            try:
+                if _stored(row.arxiv_id):
+                    return row, DownloadOutcome(status=ALREADY_STORED)
+            except Exception as exc:            # noqa: BLE001 - download it anyway
+                log.debug("existence check for %s failed: %s", row.arxiv_id, exc)
         return row, download_one(row, session, limiter, data_dir, stop)
 
     def _claim(want: int) -> list[PaperRow]:
@@ -945,12 +988,12 @@ def run_pipeline(
             # that survived the re-check, so `todo` is always reached.
             fresh_dispatched += len(head)
         if want > 0:
-            batch = manifest.claim_batch(want, partition=partition)
+            batch = manifest.claim_batch(want, partition=live.current)
             rows += batch
             fresh_dispatched += len(batch)
             # Only these leave the `pending` pool; retries come from the failed statuses.
             claimed_from_pending += len(batch)
-        if claim_any and partition and not rows and want > 0 and not stop.is_set():
+        if claim_any and live.current and not rows and want > 0 and not stop.is_set():
             stolen = _steal(want)
             rows += stolen
             fresh_dispatched += len(stolen)
@@ -980,7 +1023,7 @@ def run_pipeline(
                 break                       # nothing left anywhere; the run is finishing
             for row in batch:
                 inspected += 1
-                if store is not None and store.exists(store.name_for("md", row.arxiv_id)):
+                if store is not None and _stored(row.arxiv_id):
                     # Already converted elsewhere. Record it and move on -- no download,
                     # no conversion, and not counted as this run's own work.
                     writer.submit(TaskResult(arxiv_id=row.arxiv_id, status=DONE,
@@ -990,8 +1033,8 @@ def run_pipeline(
                     continue
                 taken.append(row)
         if taken or tallies.get("already_elsewhere"):
-            log.info("claim-any: took %d paper(s) from outside slice %s", len(taken),
-                     partition)
+            log.info("claim-any: took %d paper(s) from outside %s", len(taken),
+                     describe_partition(live.current))
         return taken
 
     # Back-pressure, so that running out of memory slows the crawl down instead of
@@ -1017,9 +1060,8 @@ def run_pipeline(
         elapsed = max(1e-6, time.monotonic() - run_started)
         return {
             "started_at": run_started_at,
-            "slice": describe_partition(partition),
-            "devices": partition[0] if partition else 1,
-            "device_index": partition[1] if partition else 0,
+            "slice": describe_partition(live.current),
+            "share": live.current.share if live.current else 1.0,
             "slice_done": bar.n,
             "slice_total": total_papers,
             "corpus_done": corpus_done_at_start + tallies["done"],
@@ -1048,8 +1090,45 @@ def run_pipeline(
             interval=max(heartbeat_every, 5.0),
             partition=partition,
             local_path=getattr(cfg.paths, "sync_state", None),
+            journal=journal,
+            live=live if follow_plan else None,
         )
         heartbeat.start()
+
+    def _reallocate() -> None:
+        """Re-target the run at the slice the heartbeat just adopted. Main thread only.
+
+        Papers already in flight from a range this device lost are finished here; the new
+        owner's existence check skips any that land in the bucket before it reaches them.
+        """
+        nonlocal total_papers, pending_at_start, claimed_from_pending, retry_ids
+        new = live.current
+        console("allocation changed: now %s", describe_partition(new))
+        if journal is not None:
+            # Buckets just gained may have been worked by their previous owner since this
+            # run started; its journal says which. Cheap: only segments written since.
+            from .sync import pull_journal
+
+            try:
+                pulled = pull_journal(manifest, store, journal)
+                if pulled.newly_marked:
+                    console("  %s paper(s) in the new range were already done elsewhere",
+                            f"{pulled.newly_marked:,}")
+            except Exception as exc:            # noqa: BLE001 - the existence check covers it
+                log.warning("journal pull after reallocation failed: %s", exc)
+        here = manifest.stats(partition=new) if new else manifest.stats()
+        total_papers = here.get("total", 0)
+        pending_at_start = manifest.count_claimable((PENDING,), partition=new)
+        claimed_from_pending = 0
+        if getattr(retry_cfg, "on_start", True):
+            queued = set(retry_ids)
+            kept = [i for i in retry_ids if new is None or new.contains(bucket_for(i))]
+            retry_ids = kept + [i for i in manifest.claimable_ids(
+                RETRYABLE, max_attempts=max_attempts, partition=new) if i not in queued]
+        bar.total = total_papers
+        bar.n = here.get(DONE, 0)
+        _refresh_postfix()
+        bar.refresh()
 
     dl_pool = ThreadPoolExecutor(cfg.crawl.workers, thread_name_prefix="dl")
     # `max_tasks_per_child` retires a worker after N papers and starts a fresh one, so
@@ -1099,6 +1178,9 @@ def run_pipeline(
 
     try:
         while True:
+            if live.version != seen_version:
+                seen_version = live.version
+                _reallocate()
             # Top up the download pool, bounded so tmp/ cannot fill without limit — and
             # not at all while memory is short.
             held_back = not stop.is_set() and not guard.has_headroom()
@@ -1121,6 +1203,12 @@ def run_pipeline(
                 if held_back:
                     time.sleep(1.0)
                     continue
+                # A device parked at share 0 waits for a share rather than exiting, so
+                # raising its weight later puts it back to work without a restart.
+                if follow_plan and live.current is not None and live.current.empty \
+                        and not stop.is_set():
+                    time.sleep(1.0)
+                    continue
                 break
 
             done, _ = wait(downloads | set(conversions), timeout=1.0,
@@ -1131,6 +1219,14 @@ def run_pipeline(
                 if fut in downloads:
                     downloads.discard(fut)
                     row, outcome = fut.result()
+                    if outcome.status == ALREADY_STORED:
+                        # Finished elsewhere: record it, without counting it as this run's
+                        # own work or as a fresh entry in the journal.
+                        writer.submit(TaskResult(arxiv_id=row.arxiv_id, status=DONE,
+                                                 remote_only=True))
+                        tallies["already_elsewhere"] = tallies.get("already_elsewhere", 0) + 1
+                        bar.update(1)
+                        continue
                     if outcome.status == PENDING:
                         # Interrupted before it started: requeue silently, and do not
                         # let it count towards progress or the checkpoint tallies.

@@ -19,6 +19,7 @@ from src.utils.partition import (
     BUCKETS,
     DEVICES_ENV,
     INDEX_ENV,
+    Slice,
     bucket_for,
     describe,
     resolve_partition,
@@ -64,7 +65,7 @@ def test_slices_are_disjoint_and_exhaustive(devices):
     seen: dict[str, int] = {}
     for index in range(devices):
         for paper_id in IDS:
-            if bucket_for(paper_id) % devices == index:
+            if Slice.equal(devices, index).contains(bucket_for(paper_id)):
                 assert paper_id not in seen, f"{paper_id} claimed by two devices"
                 seen[paper_id] = index
     assert set(seen) == set(IDS)
@@ -79,8 +80,8 @@ def test_no_devices_means_the_whole_corpus():
 def test_environment_supplies_the_defaults(monkeypatch):
     monkeypatch.setenv(DEVICES_ENV, "3")
     monkeypatch.setenv(INDEX_ENV, "2")
-    assert resolve_partition(None, None) == (3, 2)
-    assert resolve_partition(4, 1) == (4, 1)     # an explicit flag still wins
+    assert resolve_partition(None, None) == Slice.equal(3, 2)
+    assert resolve_partition(4, 1) == Slice.equal(4, 1)     # an explicit flag still wins
 
 
 def test_a_lone_index_is_taken_as_one_device_of_one(monkeypatch):
@@ -109,7 +110,7 @@ def test_config_supplies_the_partition(monkeypatch):
         devices = 2
         device_index = 1
 
-    assert resolve_partition(cfg=Cfg()) == (2, 1)
+    assert resolve_partition(cfg=Cfg()) == Slice.equal(2, 1)
 
 
 def test_precedence_is_flag_then_environment_then_config(monkeypatch):
@@ -119,13 +120,13 @@ def test_precedence_is_flag_then_environment_then_config(monkeypatch):
 
     monkeypatch.delenv(DEVICES_ENV, raising=False)
     monkeypatch.delenv(INDEX_ENV, raising=False)
-    assert resolve_partition(cfg=Cfg()) == (2, 1)            # config alone
+    assert resolve_partition(cfg=Cfg()) == Slice.equal(2, 1)            # config alone
 
     monkeypatch.setenv(DEVICES_ENV, "4")
     monkeypatch.setenv(INDEX_ENV, "3")
-    assert resolve_partition(cfg=Cfg()) == (4, 3)            # environment wins over config
+    assert resolve_partition(cfg=Cfg()) == Slice.equal(4, 3)            # environment wins over config
 
-    assert resolve_partition(8, 7, cfg=Cfg()) == (8, 7)      # a flag wins over both
+    assert resolve_partition(8, 7, cfg=Cfg()) == Slice.equal(8, 7)      # a flag wins over both
 
 
 def test_a_single_device_in_the_config_is_the_whole_corpus(monkeypatch):
@@ -172,7 +173,9 @@ def test_a_config_object_without_the_fields_is_harmless(monkeypatch):
 
 def test_describe():
     assert describe(None) == "the whole corpus"
-    assert describe((2, 0)) == "slice 1 of 2"
+    assert describe(Slice.equal(2, 0)) == "buckets 0-127 (50.0%)"
+    assert describe(Slice(10, 10)) == "no share (0%)"
+    assert Slice(10, 10)                     # empty, but never mistaken for "no filter"
 
 
 # --- the manifest ----------------------------------------------------------------------
@@ -185,8 +188,8 @@ def _manifest(tmp_path, ids=IDS):
 def test_claims_from_two_devices_never_overlap(tmp_path):
     a = _manifest(tmp_path)
     b = Manifest(tmp_path / "m.db")              # the same file, two claimers
-    got_a = {r.arxiv_id for r in a.claim_batch(len(IDS), partition=(2, 0))}
-    got_b = {r.arxiv_id for r in b.claim_batch(len(IDS), partition=(2, 1))}
+    got_a = {r.arxiv_id for r in a.claim_batch(len(IDS), partition=Slice.equal(2, 0))}
+    got_b = {r.arxiv_id for r in b.claim_batch(len(IDS), partition=Slice.equal(2, 1))}
     assert not (got_a & got_b)
     assert got_a | got_b == set(IDS)
     assert got_a and got_b
@@ -203,11 +206,12 @@ def test_an_unpartitioned_claim_still_takes_everything(tmp_path):
 def test_counts_and_id_lists_honour_the_partition(tmp_path):
     m = _manifest(tmp_path)
     whole = m.count_claimable((PENDING,))
-    half = m.count_claimable((PENDING,), partition=(2, 0))
+    half = m.count_claimable((PENDING,), partition=Slice.equal(2, 0))
     assert whole == len(IDS)
     assert 0 < half < whole
-    assert len(m.claimable_ids((PENDING,), partition=(2, 0))) == half
-    assert all(bucket_for(i) % 2 == 0 for i in m.claimable_ids((PENDING,), partition=(2, 0)))
+    assert len(m.claimable_ids((PENDING,), partition=Slice.equal(2, 0))) == half
+    ids = m.claimable_ids((PENDING,), partition=Slice.equal(2, 0))
+    assert all(Slice.equal(2, 0).contains(bucket_for(i)) for i in ids)
     m.close()
 
 
@@ -215,8 +219,8 @@ def test_the_partition_does_not_disturb_the_attempt_ceiling(tmp_path):
     m = _manifest(tmp_path, ids=IDS[:50])
     m.conn.execute("UPDATE papers SET status = ?, attempts = 9", (DONE,))
     m.conn.commit()
-    assert m.count_claimable((DONE,), max_attempts=4, partition=(2, 0)) == 0
-    assert m.count_claimable((DONE,), partition=(2, 0)) > 0
+    assert m.count_claimable((DONE,), max_attempts=4, partition=Slice.equal(2, 0)) == 0
+    assert m.count_claimable((DONE,), partition=Slice.equal(2, 0)) > 0
     m.close()
 
 
@@ -294,16 +298,16 @@ def test_two_runs_over_one_manifest_never_convert_the_same_paper(tmp_path, monke
     with Manifest(cfg.paths.manifest_db) as m:
         m.add_papers([PaperRow(arxiv_id=i, version="v1", shard="2301") for i in ids])
 
-    C.run_pipeline(cfg, partition=(2, 0))
+    C.run_pipeline(cfg, partition=Slice.equal(2, 0))
 
     second: list[str] = []
     cfg2, C2 = _pipeline_cfg(tmp_path, monkeypatch, second)
-    C2.run_pipeline(cfg2, partition=(2, 1))
+    C2.run_pipeline(cfg2, partition=Slice.equal(2, 1))
 
     assert first and second
     assert not set(first) & set(second)          # no paper crawled twice
     assert set(first) | set(second) == set(ids)  # and none missed
-    assert all(bucket_for(i) % 2 == 0 for i in first)
+    assert all(Slice.equal(2, 0).contains(bucket_for(i)) for i in first)
     with Manifest(cfg.paths.manifest_db) as m:
         assert m.stats()[DONE] == len(ids)
 
@@ -343,8 +347,8 @@ def test_claim_any_takes_the_other_slice_but_not_its_finished_papers(tmp_path, m
     from src.utils.objectstore import object_name
 
     ids = [f"2301.{i:05d}" for i in range(40)]
-    mine = [i for i in ids if bucket_for(i) % 2 == 0]
-    theirs = [i for i in ids if bucket_for(i) % 2 == 1]
+    mine = [i for i in ids if Slice.equal(2, 0).contains(bucket_for(i))]
+    theirs = [i for i in ids if Slice.equal(2, 1).contains(bucket_for(i))]
     assert mine and theirs
 
     # Half of the other device's slice is already converted and in the bucket.
@@ -358,7 +362,7 @@ def test_claim_any_takes_the_other_slice_but_not_its_finished_papers(tmp_path, m
     with Manifest(cfg.paths.manifest_db) as m:
         m.add_papers([PaperRow(arxiv_id=i, version="v1", shard="2301") for i in ids])
 
-    tallies = C.run_pipeline(cfg, partition=(2, 0), to_minio=True, claim_any=True,
+    tallies = C.run_pipeline(cfg, partition=Slice.equal(2, 0), to_minio=True, claim_any=True,
                              sync_bucket=False)
 
     # Its own slice, plus the part of the other slice nobody had done.
@@ -388,12 +392,12 @@ def test_the_published_marker_describes_this_run(tmp_path, monkeypatch):
     with Manifest(cfg.paths.manifest_db) as m:
         m.add_papers([PaperRow(arxiv_id=i, version="v1", shard="2301") for i in ids])
 
-    C.run_pipeline(cfg, partition=(2, 0), to_minio=True, sync_bucket=False)
+    C.run_pipeline(cfg, partition=Slice.equal(2, 0), to_minio=True, sync_bucket=False)
 
     marker = json.loads(client.objects[marker_name("dev-a", prefix="arxiv")])
     run = marker["run"]
     assert marker["device"] == "dev-a"
-    assert (marker["devices"], marker["device_index"]) == (2, 0)
+    assert marker["range"] == Slice.equal(2, 0).to_json()
     assert run["state"] == "finished"
     assert isinstance(run["started_at"], str) and run["started_at"].startswith("20")
     assert run["slice_total"] == run["slice_done"] == len(converted)
@@ -410,8 +414,8 @@ def test_without_claim_any_a_device_stops_at_its_own_slice(tmp_path, monkeypatch
     with Manifest(cfg.paths.manifest_db) as m:
         m.add_papers([PaperRow(arxiv_id=i, version="v1", shard="2301") for i in ids])
 
-    C.run_pipeline(cfg, partition=(2, 0), to_minio=True, sync_bucket=False)
-    assert set(converted) == {i for i in ids if bucket_for(i) % 2 == 0}
+    C.run_pipeline(cfg, partition=Slice.equal(2, 0), to_minio=True, sync_bucket=False)
+    assert set(converted) == {i for i in ids if Slice.equal(2, 0).contains(bucket_for(i))}
 
 
 def test_the_start_of_run_sync_marks_papers_the_other_device_finished(tmp_path, monkeypatch):
@@ -447,22 +451,22 @@ def test_the_plan_overrides_a_stale_local_config(monkeypatch):
         device_index = 1
 
     plan = {"devices": 4, "assignments": {"CIT": 2, "mac-studio": 0}}
-    assert resolve_partition(cfg=Cfg(), plan=plan, device="CIT") == (4, 2)
-    assert resolve_partition(cfg=Cfg(), plan=plan, device="mac-studio") == (4, 0)
+    assert resolve_partition(cfg=Cfg(), plan=plan, device="CIT") == Slice.equal(4, 2)
+    assert resolve_partition(cfg=Cfg(), plan=plan, device="mac-studio") == Slice.equal(4, 0)
 
 
 def test_a_flag_still_beats_the_plan(monkeypatch):
     monkeypatch.delenv(DEVICES_ENV, raising=False)
     monkeypatch.delenv(INDEX_ENV, raising=False)
     plan = {"devices": 4, "assignments": {"CIT": 2}}
-    assert resolve_partition(8, 7, plan=plan, device="CIT") == (8, 7)
+    assert resolve_partition(8, 7, plan=plan, device="CIT") == Slice.equal(8, 7)
 
 
 def test_a_machine_the_plan_ignores_falls_back_to_its_own_settings(monkeypatch):
     monkeypatch.setenv(DEVICES_ENV, "2")
     monkeypatch.setenv(INDEX_ENV, "1")
     plan = {"devices": 4, "assignments": {"other": 0}}
-    assert resolve_partition(plan=plan, device="CIT") == (2, 1)
+    assert resolve_partition(plan=plan, device="CIT") == Slice.equal(2, 1)
 
 
 def test_follow_plan_false_pins_a_machine_to_its_config(monkeypatch):
@@ -475,7 +479,7 @@ def test_follow_plan_false_pins_a_machine_to_its_config(monkeypatch):
 
     plan = {"devices": 4, "assignments": {"CIT": 2}}
     assert resolve_partition(cfg=Cfg(), plan=plan, device="CIT",
-                             follow_plan=False) == (2, 1)
+                             follow_plan=False) == Slice.equal(2, 1)
 
 
 def test_a_malformed_plan_is_ignored_rather_than_raising(monkeypatch):
@@ -504,11 +508,11 @@ def test_the_run_reports_a_changed_allocation(tmp_path, monkeypatch, capsys):
         m.add_papers([PaperRow(arxiv_id=f"2301.{i:05d}", version="v1", shard="2301")
                       for i in range(40)])
 
-    C.run_pipeline(cfg, partition=(4, 0))
+    C.run_pipeline(cfg, partition=Slice.equal(4, 0))
 
     changed = [line for line in said if "allocation changed" in line]
     assert len(changed) == 1
-    assert "slice 1 of 2" in changed[0] and "slice 1 of 4" in changed[0]
+    assert "buckets 0-127" in changed[0] and "buckets 0-63" in changed[0]
 
 
 def test_an_unchanged_allocation_says_nothing(tmp_path, monkeypatch):
@@ -526,7 +530,7 @@ def test_an_unchanged_allocation_says_nothing(tmp_path, monkeypatch):
         m.add_papers([PaperRow(arxiv_id=f"2301.{i:05d}", version="v1", shard="2301")
                       for i in range(40)])
 
-    C.run_pipeline(cfg, partition=(4, 0))
+    C.run_pipeline(cfg, partition=Slice.equal(4, 0))
     assert not [line for line in said if "allocation changed" in line]
 
 
@@ -550,7 +554,7 @@ def test_a_dropped_machine_refuses_rather_than_duplicating(monkeypatch, tmp_path
     client = FakeClient()
     monkeypatch.setattr(O, "MinioStore", lambda s, **kw: real(s, client=client))
     store = real(O.MinioSettings.from_config(Config().minio), client=client)
-    write_plan(store, 3, {"a": 0, "b": 1, "c": 2}, by="a")
+    write_plan(store, weights={"a": 1, "b": 1, "c": 1}, order=["a", "b", "c"], by="a")
 
     cfg = Config()
     cfg.paths = Paths(data_dir=tmp_path)
@@ -564,9 +568,112 @@ def test_a_dropped_machine_refuses_rather_than_duplicating(monkeypatch, tmp_path
 
     # opting out is the deliberate escape, and it works
     cfg.sync.follow_plan = False
-    assert M._resolve_slice(cfg, args) == (4, 3)
+    assert M._resolve_slice(cfg, args) == Slice.equal(4, 3)
 
     # a machine the plan names is unaffected
     cfg.sync.follow_plan = True
     cfg.sync.device = "b"
-    assert M._resolve_slice(cfg, args) == (3, 1)
+    assert M._resolve_slice(cfg, args) == Slice(86, 171)
+
+
+# --- reallocating a running crawl --------------------------------------------------------
+def _capture_live(monkeypatch, C):
+    """Hand the test the run's LiveSlice, standing in for the heartbeat that moves it."""
+    captured = {}
+    real = C.LiveSlice
+
+    def make(current):
+        captured["live"] = real(current)
+        return captured["live"]
+
+    monkeypatch.setattr(C, "LiveSlice", make)
+    return captured
+
+
+def test_a_running_crawl_takes_up_a_grown_share(tmp_path, monkeypatch):
+    ids = [f"2301.{i:05d}" for i in range(60)]
+    converted: list[str] = []
+    cfg, C = _pipeline_cfg(tmp_path, monkeypatch, converted)
+    captured = _capture_live(monkeypatch, C)
+    said: list[str] = []
+    monkeypatch.setattr(C, "console", lambda msg, *a: said.append(msg % a if a else msg))
+    _with_fake_bucket(monkeypatch)
+    real_convert = C.convert_and_write
+
+    def convert(row, *a, **kw):
+        captured["live"].update(None)          # `devices --share` gave this device it all
+        return real_convert(row, *a, **kw)
+
+    monkeypatch.setattr(C, "convert_and_write", convert)
+    with Manifest(cfg.paths.manifest_db) as m:
+        m.add_papers([PaperRow(arxiv_id=i, version="v1", shard="2301") for i in ids])
+
+    C.run_pipeline(cfg, partition=Slice.equal(2, 0), to_minio=True, sync_bucket=False,
+                   follow_plan=True)
+
+    assert set(converted) == set(ids)          # the half it did not start with, too
+    assert len(converted) == len(ids)          # and nothing twice
+    assert any("allocation changed: now the whole corpus" in line for line in said)
+
+
+def test_a_running_crawl_lets_go_of_a_shrunk_share(tmp_path, monkeypatch):
+    ids = [f"2301.{i:05d}" for i in range(60)]
+    converted: list[str] = []
+    cfg, C = _pipeline_cfg(tmp_path, monkeypatch, converted)
+    captured = _capture_live(monkeypatch, C)
+    _with_fake_bucket(monkeypatch)
+    real_convert = C.convert_and_write
+    smaller = Slice(0, 64)
+
+    def convert(row, *a, **kw):
+        captured["live"].update(smaller)
+        return real_convert(row, *a, **kw)
+
+    monkeypatch.setattr(C, "convert_and_write", convert)
+    with Manifest(cfg.paths.manifest_db) as m:
+        m.add_papers([PaperRow(arxiv_id=i, version="v1", shard="2301") for i in ids])
+
+    C.run_pipeline(cfg, partition=Slice.equal(2, 0), to_minio=True, sync_bucket=False,
+                   follow_plan=True)
+
+    outside = [i for i in converted if not smaller.contains(bucket_for(i))]
+    # Only what was already dispatched before the change may fall outside the new range.
+    assert len(outside) <= 4 * cfg.convert.workers
+    assert set(i for i in ids if smaller.contains(bucket_for(i))) <= set(converted)
+
+
+def test_a_parked_device_waits_for_a_share(tmp_path, monkeypatch):
+    import threading
+
+    ids = [f"2301.{i:05d}" for i in range(20)]
+    converted: list[str] = []
+    cfg, C = _pipeline_cfg(tmp_path, monkeypatch, converted)
+    captured = _capture_live(monkeypatch, C)
+    _with_fake_bucket(monkeypatch)
+    with Manifest(cfg.paths.manifest_db) as m:
+        m.add_papers([PaperRow(arxiv_id=i, version="v1", shard="2301") for i in ids])
+
+    timer = threading.Timer(0.5, lambda: captured["live"].update(None))
+    timer.start()
+    C.run_pipeline(cfg, partition=Slice(0, 0), to_minio=True, sync_bucket=False,
+                   follow_plan=True)
+    timer.join()
+    assert set(converted) == set(ids)
+
+
+def test_a_paper_already_in_the_bucket_is_not_downloaded(tmp_path, monkeypatch):
+    from src.utils.objectstore import object_name
+
+    ids = [f"2301.{i:05d}" for i in range(10)]
+    objects = [object_name(k, i, prefix="arxiv") for i in ids[:4] for k in ("md", "meta")]
+    # md without meta is not finished: that one still gets crawled
+    objects.append(object_name("md", ids[4], prefix="arxiv"))
+    converted: list[str] = []
+    cfg, C = _pipeline_cfg(tmp_path, monkeypatch, converted)
+    _with_fake_bucket(monkeypatch, objects)
+    with Manifest(cfg.paths.manifest_db) as m:
+        m.add_papers([PaperRow(arxiv_id=i, version="v1", shard="2301") for i in ids])
+
+    tallies = C.run_pipeline(cfg, to_minio=True, sync_bucket=False)
+    assert set(converted) == set(ids[4:])
+    assert tallies["already_elsewhere"] == 4

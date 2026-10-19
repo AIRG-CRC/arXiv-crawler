@@ -20,7 +20,8 @@ from .utils.checkpoint import CheckpointStore
 from .utils.converter import REGISTRY
 from .utils.crawler import run_pipeline
 from .utils.logging_setup import configure_logging, console
-from .utils.partition import DEVICES_ENV, INDEX_ENV, resolve_partition
+from .utils.partition import DEVICES_ENV, INDEX_ENV, Slice, resolve_partition
+from .utils.partition import describe as describe_partition
 from .utils.prepare_data import prepare
 from .utils.state import DONE, FAILED_CONVERT, FAILED_DOWNLOAD, NO_PDF, PENDING, Manifest
 
@@ -97,6 +98,9 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         cfg, limit=args.limit, keep_pdf=args.keep_pdf, worker_bars=args.worker_bars,
         retry_all=args.retry_all, to_minio=getattr(args, "to_minio", False),
         partition=partition, sync_bucket=args.sync, claim_any=args.claim_any,
+        # A flag pins the slice for this run; otherwise a running crawl follows the plan.
+        follow_plan=(args.devices is None and args.device_index is None
+                     and bool(getattr(cfg.sync, "follow_plan", True))),
     )
     summary = (
         "processed {processed:,}: {done:,} converted, {no_pdf:,} without a PDF, "
@@ -302,11 +306,16 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
         if not shards:
             print("nothing to sync — every paper in this manifest is already done")
             return 0
-        print(f"{'checking' if args.dry_run else 'syncing'} {store.describe()}")
-        bar = tqdm(total=shards, unit="shard", desc="sync", smoothing=0.05)
+        print(f"{'checking' if args.dry_run else 'syncing'} {store.describe()}"
+              + (" — full bucket listing" if args.full else " from the done-journals"))
+        if args.full:
+            bar = tqdm(total=shards, unit="shard", desc="sync", smoothing=0.05)
+        else:
+            # Segments, not shards, and how many is not known until each folder is listed.
+            bar = tqdm(unit="segment", desc="sync", smoothing=0.05)
         try:
-            report = run_sync(cfg, manifest, store, partition=partition,
-                              dry_run=args.dry_run, progress=bar)
+            report, _journal = run_sync(cfg, manifest, store, partition=partition,
+                                        dry_run=args.dry_run, progress=bar, full=args.full)
         except Exception as exc:            # noqa: BLE001 - the network, mid-scan
             log.error("sync failed", exc_info=exc)
             print(f"\nerror: sync failed ({type(exc).__name__}: {exc}). Whatever it had "
@@ -343,15 +352,15 @@ def _shared_plan(cfg: Config) -> dict | None:
         return None
 
 
-def _resolve_slice(cfg: Config, args: argparse.Namespace) -> tuple[int, int] | None:
+def _resolve_slice(cfg: Config, args: argparse.Namespace) -> "Slice | None":
     """This device's slice, from the flag, the shared plan, the environment or the config.
 
     Raises ValueError with something the user can act on. The one case worth spelling out:
     a plan that splits the corpus but does not name this device, with nothing local to fall
-    back on. Defaulting to slice 0 there would silently duplicate whichever machine really
-    owns slice 0, so it is refused instead.
+    back on. Defaulting to some slice there would silently duplicate whichever machine
+    really owns it, so it is refused instead.
     """
-    from .utils.sync import device_name, plan_partition
+    from .utils.sync import device_name, plan_partition, plan_splits
 
     plan = _shared_plan(cfg)
     device = device_name(cfg.sync)
@@ -360,27 +369,25 @@ def _resolve_slice(cfg: Config, args: argparse.Namespace) -> tuple[int, int] | N
         args.devices, args.device_index, cfg.sync,
         plan=plan, device=device, follow_plan=follow,
     )
+    explicit = args.devices is not None or args.device_index is not None
     # One rule, so there is nothing to reason about: a machine that follows a plan which
     # splits the corpus has to be named in it. Falling back to local settings here is what
     # a dropped machine does when a supervisor restarts it -- it would quietly re-crawl a
     # slice that the remaining machines are already covering, for as long as nobody noticed.
     # Refusing is recoverable in one command; twelve hours of duplicate downloads is not.
-    if (follow and plan and int(plan.get("devices") or 1) > 1
+    if (follow and not explicit and plan and plan_splits(plan)
             and plan_partition(plan, device) is None):
-        spare = [i for i in range(int(plan["devices"]))
-                 if i not in set((plan.get("assignments") or {}).values())]
         raise ValueError(
-            f"the shared allocation splits this corpus {plan['devices']} ways but does not "
-            f"name this device ('{device}').\n"
-            f"  if it should crawl:   python -m src.main devices --assign {device}="
-            f"{spare[0] if spare else '<n>'}\n"
+            f"the shared allocation splits this corpus but does not name this device "
+            f"('{device}').\n"
+            f"  if it should crawl:   python -m src.main devices --share {device}=<weight>\n"
             f"  if it should not:     stop it, or set sync.follow_plan: false to ignore the "
             f"allocation\n"
-            f"  to re-derive everything from the machines that are reporting:\n"
+            f"  to share equally among the machines that are reporting:\n"
             f"                        python -m src.main devices --auto")
-    if follow and plan and plan_partition(plan, device) == partition and partition:
-        console("allocation: slice %d of %d, from the shared plan set by %s",
-                partition[1] + 1, partition[0], plan.get("updated_by", "?"))
+    if follow and not explicit and plan and plan_partition(plan, device) is not None:
+        console("allocation: %s, from the shared plan set by %s",
+                describe_partition(partition), plan.get("updated_by", "?"))
     return partition
 
 
@@ -436,68 +443,63 @@ def cmd_devices(cfg: Config, args: argparse.Namespace) -> int:
     me = device_name(cfg.sync)
 
     # --- changing the allocation -----------------------------------------------------
-    if args.set_devices or args.assign or args.auto or args.unassign or args.forget:
-        from .utils.sync import describe_plan, forget_device, plan_name, write_plan
+    if args.set_devices or args.share or args.auto or args.unassign or args.forget:
+        from .utils.sync import (
+            describe_plan, forget_device, merge_shares, plan_name, plan_ranges, write_plan,
+        )
 
         existing = read_plan(store) or {}
-        assignments: dict[str, int] = dict(existing.get("assignments") or {})
-        devices = args.set_devices or int(existing.get("devices") or 0)
         dropped = {name.strip() for name in (args.unassign or []) if name.strip()}
         retired = {name.strip() for name in (args.forget or []) if name.strip()}
 
+        shares: dict[str, float] = {}
+        for pair in args.share or []:
+            name, _, raw = pair.partition("=")
+            try:
+                shares[name.strip()] = float(raw.strip().rstrip("%"))
+            except ValueError:
+                name = ""
+            if not name.strip():
+                print(f"error: --share wants NAME=WEIGHT, got {pair!r}", file=sys.stderr)
+                return 2
+
         # Retiring deletes the marker first, so the rebuild below cannot see it. Leaving the
         # marker is what made `--auto` resurrect the machine you removed on the last run.
-        for name in sorted(retired):
-            if name == me:
-                print(f"error: refusing to forget this machine ('{me}') — run it from "
-                      f"another device", file=sys.stderr)
-                return 2
-            existed = forget_device(store, name)
-            print(f"  {'forgot' if existed else 'no marker for'} '{name}'")
+        if retired and me in retired:
+            print(f"error: refusing to forget this machine ('{me}') — run it from "
+                  f"another device", file=sys.stderr)
+            return 2
+        if not args.dry_run:
+            for name in sorted(retired):
+                existed = forget_device(store, name)
+                print(f"  {'forgot' if existed else 'no marker for'} '{name}'")
         if retired:
             markers = [m for m in markers if m.get("device") not in retired]
             dropped |= retired
 
-        if args.auto:
-            # Every device that has reported, plus this one, minus anything being dropped,
-            # in name order -- and reindexed contiguously, so scaling *down* produces a
-            # valid allocation instead of leaving a hole where the removed machine was.
-            # Deterministic, so running it twice is a no-op; a deliberate one-shot command
-            # rather than a negotiation, which is what keeps it free of races.
-            names = sorted(
-                ({str(m.get("device")) for m in markers if m.get("device")} | {me}) - dropped
-            )
-            assignments = {name: i for i, name in enumerate(names)}
-            devices = args.set_devices or len(names)
-        else:
-            for name in dropped:
-                assignments.pop(name, None)
-
-        for pair in args.assign or []:
-            name, _, raw = pair.partition("=")
-            if not name or not raw.strip().lstrip("-").isdigit():
-                print(f"error: --assign wants NAME=INDEX, got {pair!r}", file=sys.stderr)
+        equal = None
+        if args.auto or args.set_devices:
+            # Every device that has reported, plus this one, minus anything being dropped:
+            # an equal share each. Deterministic, so running it twice is a no-op; a
+            # deliberate one-shot command rather than a negotiation, which keeps it race-free.
+            equal = sorted(
+                ({str(m.get("device")) for m in markers if m.get("device")} | {me}) - dropped)
+            if args.set_devices and args.set_devices != len(equal):
+                print(f"error: --set-devices {args.set_devices} but {len(equal)} machine(s) "
+                      f"are reporting ({', '.join(equal)}). Shares now go to named "
+                      f"machines — use --share NAME=WEIGHT for each, or --auto",
+                      file=sys.stderr)
                 return 2
-            assignments[name.strip()] = int(raw)
-
-        if not devices:
-            print("error: --set-devices N is needed the first time (nothing to build on)",
-                  file=sys.stderr)
-            return 2
-
-        # Scaling down leaves whoever held the top slices pointing at slices that no longer
-        # exist. `write_plan` would reject that correctly but obscurely, so say what to do.
-        stranded = sorted(n for n, i in assignments.items() if i >= devices)
-        if stranded:
-            print(f"error: {', '.join(repr(n) for n in stranded)} "
-                  f"{'is' if len(stranded) == 1 else 'are'} assigned a slice that does not "
-                  f"exist in a {devices}-device split.\n"
-                  f"  to drop  {stranded[0]}:  devices --auto --unassign {stranded[0]}\n"
-                  f"  to keep it: reindex everyone with  devices --auto --set-devices "
-                  f"{max(len(assignments), devices)}", file=sys.stderr)
-            return 2
         try:
-            plan = write_plan(store, devices, assignments, by=me)
+            weights, order = merge_shares(existing, shares, drop=dropped, equal=equal)
+            if args.dry_run:
+                from .utils.partition import ranges_from_weights
+
+                plan = {"ranges": {k: v.to_json() for k, v in
+                                   ranges_from_weights(order, weights).items()},
+                        "weights": weights, "updated_by": me, "updated_at": "(dry run)"}
+            else:
+                plan = write_plan(store, weights=weights, order=order, by=me)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -507,19 +509,19 @@ def cmd_devices(cfg: Config, args: argparse.Namespace) -> int:
                   f"({type(exc).__name__}: {exc})", file=sys.stderr)
             return 2
 
-        print(f"\nallocation written to {store.describe()}/{plan_name('')}\n")
+        if args.dry_run:
+            print("\nwould write this allocation (nothing changed):\n")
+        else:
+            print(f"\nallocation written to {store.describe()}/{plan_name('')}\n")
         for line in describe_plan(plan):
             print(f"  {line}")
-        unassigned = plan["devices"] - len(plan["assignments"])
         print()
-        if me not in plan["assignments"]:
-            print(f"this machine ('{me}') is not assigned a slice yet — "
-                  f"`devices --assign {me}=<n>` before crawling here.")
-        elif unassigned > 0:
-            print("every machine picks this up at its next run; the unassigned slice(s) "
-                  "will not be crawled until a device takes them.")
-        else:
-            print("every machine picks this up at its next run — no per-machine edits.")
+        if me not in plan_ranges(plan):
+            print(f"this machine ('{me}') has no share yet — "
+                  f"`devices --share {me}=<weight>` before crawling here.")
+        elif not args.dry_run:
+            print(f"running crawls switch within ~{cfg.sync.heartbeat_seconds}s; stopped "
+                  f"machines pick it up when they next start — no per-machine edits.")
         return 0
 
     print(f"\nDevices sharing {store.describe()}\n")
@@ -537,14 +539,14 @@ def cmd_devices(cfg: Config, args: argparse.Namespace) -> int:
               f"{'papers/min':>12}{'last seen':>12}")
     print(header)
     print("-" * len(header))
-    ordered = sorted(markers, key=lambda m: (m.get("device_index", 0) or 0,
-                                             str(m.get("device", ""))))
+    from .utils.sync import WHOLE, marker_range
+
+    ordered = sorted(markers, key=lambda m: (marker_range(m).lo, str(m.get("device", ""))))
     for marker in ordered:
         run = marker.get("run") or {}
         name = str(marker.get("device", "?"))[:17]
-        devices = marker.get("devices", 1) or 1
-        index = marker.get("device_index", 0) or 0
-        slice_label = f"{index + 1}/{devices}" if devices > 1 else "all"
+        ran = marker_range(marker)
+        slice_label = "all" if ran == WHOLE else f"{ran.share * 100:.1f}%"
         state = str(run.get("state") or marker.get("state") or "idle")
         if run.get("paused"):
             state = "cooldown"
@@ -575,14 +577,14 @@ def cmd_devices(cfg: Config, args: argparse.Namespace) -> int:
         if not plan:
             print("\nset one shared allocation, so the count is changed in one place and "
                   "no machine can be missed:")
-            print("  python -m src.main devices --set-devices N --auto")
-        elif any("not assigned to any device" in p for p in problems):
-            print("\nassign the remaining slice(s), or lower the count to match the "
+            print("  python -m src.main devices --auto      (or --share NAME=WEIGHT ...)")
+        elif any("assigned to no device" in p for p in problems):
+            print("\ngive the unowned share to a machine, or share equally among the "
                   "machines you have:")
-            print("  python -m src.main devices --auto")
+            print("  python -m src.main devices --share NAME=WEIGHT   |   devices --auto")
         else:
-            print("\nthe allocation is fine; the machine(s) above are still running on the "
-                  "previous one. Restart them and they will pick it up.")
+            print("\nthe allocation is fine; the machine(s) above are still on the previous "
+                  "one. They switch at their next heartbeat, or at their next start.")
         return 1
     if len(markers) > 1:
         print(f"\n* this machine. Each row is that device's own last report, republished "
@@ -616,7 +618,7 @@ def cmd_status(cfg: Config, _args: argparse.Namespace) -> int:
                 state = json.loads(marker.read_text(encoding="utf-8"))
                 print(f"Last bucket sync: {state.get('synced_at', '?')} "
                       f"as device '{state.get('device', '?')}' "
-                      f"({state.get('report', {}).get('newly_marked', 0):,} marked done)")
+                      f"({state.get('sync', {}).get('newly_marked', 0):,} marked done)")
             except (OSError, ValueError):
                 pass
         print(f"{'status':<18}{'papers':>12}{'share':>9}")
@@ -818,6 +820,9 @@ def build_parser() -> argparse.ArgumentParser:
     sy.add_argument("--devices", type=int, metavar="N",
                     help="recorded in this device's marker, for the partition cross-check")
     sy.add_argument("--device-index", type=int, metavar="I")
+    sy.add_argument("--full", action="store_true",
+                    help="list the whole bucket instead of reading the done-journals (slow, "
+                         "resumable); for a bucket written by machines that never journalled")
     sy.add_argument("--force", action="store_true",
                     help="sync even though a run looks like it is in flight")
     sy.set_defaults(func=cmd_sync)
@@ -837,11 +842,15 @@ def build_parser() -> argparse.ArgumentParser:
     sdv.add_argument("--devices", type=int, metavar="N",
                      help="this machine's device count, for the clash check")
     sdv.add_argument("--device-index", type=int, metavar="I")
+    sdv.add_argument("--share", action="append", metavar="NAME=WEIGHT",
+                     help="set one machine's share of the corpus, as a relative weight "
+                          "(DGX-1=60 DGX-2=40, or 3 and 2 -- only the ratio matters); 0 "
+                          "parks a machine. Repeatable; machines not named keep their "
+                          "weight. Running crawls switch within one heartbeat")
+    sdv.add_argument("--dry-run", action="store_true",
+                     help="print the allocation a change would produce, without writing it")
     sdv.add_argument("--set-devices", type=int, metavar="N",
-                     help="publish a new shared device count; every machine adopts it at "
-                          "its next run, with no per-machine edits")
-    sdv.add_argument("--assign", action="append", metavar="NAME=INDEX",
-                     help="assign one device to one slice; repeatable")
+                     help="equal shares, checked against N reporting machines (prefer --auto)")
     sdv.add_argument("--unassign", action="append", metavar="NAME",
                      help="remove one device from the allocation but keep its marker, for a "
                           "machine that is only away for a while. Repeatable")
@@ -850,9 +859,8 @@ def build_parser() -> argparse.ArgumentParser:
                           "allocation, so `devices` stops listing it and --auto stops "
                           "bringing it back. Repeatable")
     sdv.add_argument("--auto", action="store_true",
-                     help="assign every device that has reported (plus this one, less any "
-                          "--unassign) to a slice in name order, reindexed contiguously, "
-                          "and set the count to match")
+                     help="give every device that has reported (plus this one, less any "
+                          "--unassign) an equal share; combine with --share to adjust one")
     sdv.set_defaults(func=cmd_devices)
 
     ss = sub.add_parser("status", help="progress report")

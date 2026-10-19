@@ -260,7 +260,7 @@ class MinioStore:
         return len(payload)
 
     def get_bytes(self, name: str) -> bytes:
-        """Download one small object. Only used for the device markers.
+        """Download one small object: device markers, the plan, journal segments.
 
         The SDK hands back a urllib3 response that has to be closed *and* have its
         connection released, or the pool leaks a socket per call.
@@ -344,11 +344,34 @@ class MinioStore:
         run writes objects all over the keyspace; (2) old-style ids shard to `9901`, which
         sorts after every modern `2xxx` shard; (3) `misc` sorts after all of them. Any
         stored cursor therefore skips papers silently and permanently.
+
+        The done-journal is the one exception, and it is safe for the opposite reasons: each
+        `_state/done/<device>/` folder has exactly one writer, which names its segments with
+        a zero-padded counter, so key order *is* write order and nothing is ever written
+        behind the cursor.
         """
         target = "/".join(
             p for p in (self.settings.prefix.strip("/"), relative.strip("/")) if p
         )
         yield from self._iter_raw(f"{target}/" if target else None, start_after=start_after)
+
+    def list_prefixes(self, relative: str) -> list[str]:
+        """The immediate "folders" under `relative`, as bare names -- one level, not deep.
+
+        A delimited listing, so its cost is the number of folders rather than the number of
+        objects under them. That is what lets the journal reader find every device without
+        walking every segment any device ever wrote.
+        """
+        target = "/".join(
+            p for p in (self.settings.prefix.strip("/"), relative.strip("/")) if p
+        ) + "/"
+        out = []
+        for obj in self.client.list_objects(self.settings.bucket, prefix=target,
+                                            recursive=False):
+            name = obj.object_name
+            if name.endswith("/"):
+                out.append(name[len(target):].rstrip("/"))
+        return out
 
     def describe(self) -> str:
         scheme = "https" if self.settings.secure else "http"

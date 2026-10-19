@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from .partition import bucket_for
+from .partition import Slice, bucket_for
 
 log = logging.getLogger(__name__)
 
@@ -209,21 +209,21 @@ def connect(db_path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     return conn
 
 
-def _partition_clause(partition: tuple[int, int] | None) -> tuple[str, tuple]:
-    """`AND bucket % devices = index`, or nothing at all.
+def _partition_clause(partition: "Slice | None") -> tuple[str, tuple]:
+    """`AND bucket >= lo AND bucket < hi`, or nothing at all.
 
-    `bucket % n` is not sargable, so this rides as a residual filter on idx_papers_status:
-    the scan still stops at LIMIT, it just inspects roughly `n`x as many index entries to
-    fill a batch. Negligible while pending work is plentiful, and the alternative -- a
-    per-device index -- would have to be rebuilt every time the device count changed.
+    This rides as a residual filter on idx_papers_status: the scan still stops at LIMIT, it
+    just inspects roughly `1/share` as many index entries to fill a batch. Negligible while
+    pending work is plentiful, and the alternative -- a per-device index -- would have to be
+    rebuilt every time the allocation changed.
 
     `None` yields an empty clause, so a single-device run issues exactly the SQL it did
     before partitioning existed.
     """
     if not partition:
         return "", ()
-    devices, index = partition
-    return " AND bucket % ? = ?", (devices, index)
+    predicate, params = partition.sql()
+    return f" AND {predicate}", params
 
 
 class Manifest:
@@ -276,7 +276,7 @@ class Manifest:
         statuses: tuple[str, ...] = (PENDING,),
         *,
         max_attempts: int | None = None,
-        partition: tuple[int, int] | None = None,
+        partition: "Slice | None" = None,
     ) -> list[PaperRow]:
         """Atomically move up to `n` rows to `in_flight` and return them.
 
@@ -309,7 +309,7 @@ class Manifest:
         statuses: tuple[str, ...],
         *,
         max_attempts: int | None = None,
-        partition: tuple[int, int] | None = None,
+        partition: "Slice | None" = None,
     ) -> int:
         """How many rows `claim_batch` would eventually hand out for these statuses."""
         placeholders = ", ".join("?" * len(statuses))
@@ -326,7 +326,7 @@ class Manifest:
         statuses: tuple[str, ...],
         *,
         max_attempts: int | None = None,
-        partition: tuple[int, int] | None = None,
+        partition: "Slice | None" = None,
     ) -> list[str]:
         """The ids `claim_batch` would hand out, read once and up front.
 
@@ -436,7 +436,7 @@ class Manifest:
 
 
     # Report progress function
-    def stats(self, *, partition: tuple[int, int] | None = None) -> dict[str, int]:
+    def stats(self, *, partition: "Slice | None" = None) -> dict[str, int]:
         """Counts by status, for the whole manifest or for one device's slice.
 
         `partition` is what lets a run measure its own share: with two devices the corpus
@@ -446,7 +446,8 @@ class Manifest:
         """
         where, params = ("", ())
         if partition:
-            where, params = " WHERE bucket % ? = ?", partition
+            predicate, params = partition.sql()
+            where = f" WHERE {predicate}"
         cur = self.conn.execute(
             f"SELECT status, COUNT(*) AS n FROM papers{where} GROUP BY status", params)
         counts = {r["status"]: r["n"] for r in cur}
@@ -537,6 +538,22 @@ class Manifest:
             )
             counts["newly_marked"] = cur.rowcount
         return counts
+
+    def journal_ids(self, since: str | None = None) -> list[str]:
+        """Ids for this device's done-journal.
+
+        `since=None` is the first snapshot: everything this manifest knows is done, including
+        papers it learnt about from the bucket -- harmless to repeat, and it carries forward
+        the work of a machine that never ran with a journal. With `since`, only this device's
+        own conversions finished after it, so nobody's ids are echoed back round the fleet.
+        """
+        if since is None:
+            cur = self.conn.execute("SELECT arxiv_id FROM papers WHERE status = ?", (DONE,))
+        else:
+            cur = self.conn.execute(
+                "SELECT arxiv_id FROM papers WHERE status = ? AND remote_only = 0 "
+                "AND completed_at >= ?", (DONE, since))
+        return [r[0] for r in cur]
 
     def iter_done(self) -> Iterator[sqlite3.Row]:
         yield from self.conn.execute(
