@@ -270,6 +270,24 @@ class Postgres:
 
 
 @dataclass
+class Update:
+    """Incremental metadata from arXiv (search API or OAI-PMH), on top of the Kaggle snapshot"""
+    source: str = "api"  # api | oai
+    api_url: str = "https://export.arxiv.org/api/query"
+    api_page_size: int = 1000
+    oai_url: str = "https://oaipmh.arxiv.org/oai"
+    fallback_oai_url: str | None = None
+    metadata_prefix: str = "arXivRaw"
+    on_start: bool = True
+    overlap_days: int = 2
+    recrawl_new_versions: bool = True
+    page_delay: float = 3.0
+    timeout: int = 600
+    max_attempts: int = 5
+    max_backoff: int = 900
+
+
+@dataclass
 class Config:
     paths: Paths = field(default_factory=Paths)
     scope: Scope = field(default_factory=Scope)
@@ -279,11 +297,12 @@ class Config:
     minio: Minio = field(default_factory=Minio)
     sync: Sync = field(default_factory=Sync)
     postgres: Postgres = field(default_factory=Postgres)
+    update: Update = field(default_factory=Update)
 
     SECTIONS: ClassVar[dict[str, type]] = {
         "paths": Paths, "scope": Scope, "crawl": Crawl,
         "convert": Convert, "retry": Retry, "minio": Minio, "sync": Sync,
-        "postgres": Postgres,
+        "postgres": Postgres, "update": Update,
     }
 
     @classmethod

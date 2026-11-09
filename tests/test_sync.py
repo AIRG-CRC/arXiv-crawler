@@ -22,7 +22,7 @@ from src.utils.objectstore import (
     object_name,
 )
 from src.utils.partition import BUCKETS, Slice, bucket_for
-from src.utils.state import DONE, IN_FLIGHT, NO_PDF, PENDING, Manifest, PaperRow
+from src.utils.state import DONE, IN_FLIGHT, NO_PDF, OUTDATED, PENDING, Manifest, PaperRow
 from src.utils.sync import (
     check_partition_agreement,
     device_name,
@@ -170,6 +170,25 @@ def test_in_flight_rows_are_left_alone(tmp_path):
         status = m.conn.execute(
             "SELECT status FROM papers WHERE arxiv_id = ?", ("2301.00001",)).fetchone()[0]
         assert status == IN_FLIGHT
+
+
+def test_an_outdated_paper_needs_an_object_newer_than_its_version(tmp_path):
+    """`harvest` re-queues a done paper when arXiv gains a new version. Its old objects are
+    still in the bucket, so a sync must not flip it straight back to done -- unless the
+    object was written after the new version appeared, i.e. somebody re-crawled it."""
+    stale, fresh = "2301.00001", "2301.00002"
+    store, client = _store(_objects([stale, fresh]))
+    for name in client.objects:
+        when = (datetime(2026, 11, 1, tzinfo=timezone.utc) if stale in name
+                else datetime(2026, 11, 7, tzinfo=timezone.utc))
+        client.modified[name] = when
+    with _manifest(tmp_path, ids=[stale, fresh]) as m:
+        m.conn.execute("UPDATE papers SET status = ?, version = 'v2', date_updated = ?",
+                       (OUTDATED, "2026-11-05"))
+        m.conn.commit()
+        sync_from_bucket(m, store)
+        got = dict(m.conn.execute("SELECT arxiv_id, status FROM papers").fetchall())
+        assert got == {stale: OUTDATED, fresh: DONE}
 
 
 def test_a_no_pdf_paper_converted_elsewhere_is_recovered(tmp_path):

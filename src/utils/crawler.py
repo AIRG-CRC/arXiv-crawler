@@ -45,6 +45,7 @@ from .state import (
     DONE,
     FAILED_CONVERT,
     FAILED_DOWNLOAD,
+    FRESH,
     IN_FLIGHT,
     NO_PDF,
     PENDING,
@@ -657,7 +658,7 @@ def run_pipeline(
     # `stats` stays whole-corpus, because that is what the bar measures. What is left *for
     # this device*, though, is the partitioned count -- using the corpus figure would set
     # the run's target (and the Pending= readout) too high by a factor of `devices`.
-    pending_here = manifest.count_claimable((PENDING,), partition=partition)
+    pending_here = manifest.count_claimable(FRESH, partition=partition)
     if partition:
         console("device %s — %s paper(s) pending in this slice",
                 describe_partition(partition), f"{pending_here:,}")
@@ -1118,7 +1119,7 @@ def run_pipeline(
                 log.warning("journal pull after reallocation failed: %s", exc)
         here = manifest.stats(partition=new) if new else manifest.stats()
         total_papers = here.get("total", 0)
-        pending_at_start = manifest.count_claimable((PENDING,), partition=new)
+        pending_at_start = manifest.count_claimable(FRESH, partition=new)
         claimed_from_pending = 0
         if getattr(retry_cfg, "on_start", True):
             queued = set(retry_ids)

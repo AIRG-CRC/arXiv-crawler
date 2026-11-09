@@ -1,6 +1,7 @@
 """arxiv-crawler command line interface.
 
     prepare   load the Kaggle metadata snapshot into the manifest
+    update    add papers published since the snapshot (arXiv OAI-PMH)
     run       download + convert, in parallel, resumably
     status    progress report
     retry     re-queue retryable failures
@@ -23,7 +24,9 @@ from .utils.logging_setup import configure_logging, console
 from .utils.partition import DEVICES_ENV, INDEX_ENV, Slice, resolve_partition
 from .utils.partition import describe as describe_partition
 from .utils.prepare_data import prepare
-from .utils.state import DONE, FAILED_CONVERT, FAILED_DOWNLOAD, NO_PDF, PENDING, Manifest
+from .utils.state import (
+    DONE, FAILED_CONVERT, FAILED_DOWNLOAD, NO_PDF, OUTDATED, PENDING, Manifest,
+)
 
 log = logging.getLogger("arxiv_crawler")
 
@@ -67,6 +70,48 @@ def cmd_prepare(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_update(cfg: Config, args: argparse.Namespace) -> int:
+    from .utils.harvest import HarvestError, harvest
+
+    cfg.paths.ensure()
+    with Manifest(cfg.paths.manifest_db) as m:
+        try:
+            counts = harvest(cfg, m, since=getattr(args, "from"), until=args.until,
+                             dry_run=args.dry_run)
+        except HarvestError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    print(_update_summary(counts, dry_run=args.dry_run))
+    return 0
+
+
+def _update_summary(counts: dict, *, dry_run: bool = False) -> str:
+    verb = "would add" if dry_run else "added"
+    return (
+        f"arXiv {counts['since']} → {counts['until']}: {counts['seen']:,} record(s) read, "
+        f"{counts['matched']:,} in scope; {verb} {counts['inserted']:,} new paper(s), "
+        f"{counts['version_bumped']:,} got a new version "
+        f"({counts['requeued']:,} re-queued for crawling)"
+    )
+
+
+def _update_on_start(cfg: Config) -> None:
+    """`run-minio`'s automatic harvest. A failure here must not cost the crawl: the
+    manifest already holds plenty of work, and the next run picks the delta up."""
+    from .utils.harvest import HarvestError, harvest
+
+    try:
+        with Manifest(cfg.paths.manifest_db) as m:
+            counts = harvest(cfg, m)
+    except (HarvestError, OSError) as exc:
+        log.warning("could not fetch new metadata from arXiv (%s); crawling what the "
+                    "manifest already has", exc)
+        print(f"warning: metadata update skipped: {exc}", file=sys.stderr)
+        return
+    log.info("%s", _update_summary(counts))
+    print(_update_summary(counts))
+
+
 def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
     cfg.override(
         crawl_workers=args.download_workers,
@@ -94,6 +139,10 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
                    "clients to identify themselves. Set a real address in config.yaml.")
         log.warning("%s", message)
         print(message, file=sys.stderr)
+    update = args.update if args.update is not None else (
+        cfg.update.on_start and getattr(args, "to_minio", False))
+    if update:
+        _update_on_start(cfg)
     tallies = run_pipeline(
         cfg, limit=args.limit, keep_pdf=args.keep_pdf, worker_bars=args.worker_bars,
         retry_all=args.retry_all, to_minio=getattr(args, "to_minio", False),
@@ -623,7 +672,7 @@ def cmd_status(cfg: Config, _args: argparse.Namespace) -> int:
                 pass
         print(f"{'status':<18}{'papers':>12}{'share':>9}")
         print("-" * 39)
-        for status in (DONE, PENDING, NO_PDF, FAILED_DOWNLOAD, FAILED_CONVERT):
+        for status in (DONE, PENDING, OUTDATED, NO_PDF, FAILED_DOWNLOAD, FAILED_CONVERT):
             n = s.pop(status, 0)
             print(f"{status:<18}{n:>12,}{n / total * 100:>8.1f}%")
         for status, n in sorted(s.items()):
@@ -741,6 +790,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, help="cap on papers inserted")
     sp.set_defaults(func=cmd_prepare)
 
+    su = sub.add_parser(
+        "update", help="add papers published since the snapshot, from arXiv's OAI-PMH feed")
+    su.add_argument("--from", metavar="YYYY-MM-DD",
+                    help="harvest from this date (default: the stored watermark, else the "
+                         "newest date in the manifest, minus update.overlap_days)")
+    su.add_argument("--until", metavar="YYYY-MM-DD", help="harvest up to this date")
+    su.add_argument("--dry-run", action="store_true",
+                    help="count what would change; write nothing, keep the watermark")
+    su.set_defaults(func=cmd_update)
+
     def add_run_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         """`run` and `run-minio` differ only in where the output goes, so they share
         every flag rather than keeping two lists in step by hand."""
@@ -782,6 +841,11 @@ def build_parser() -> argparse.ArgumentParser:
                             help="pause every download this long when arXiv answers 406/403, "
                                  "doubling each round it persists; 0 disables "
                                  "(default: crawl.cooldown_seconds)")
+        parser.add_argument("--update", dest="update", action="store_true", default=None,
+                            help="fetch new arXiv metadata before crawling "
+                                 "(default for run-minio: update.on_start)")
+        parser.add_argument("--no-update", dest="update", action="store_false",
+                            help="skip the metadata update")
         return parser
 
     sr = add_run_flags(sub.add_parser("run", help="download and convert, in parallel"))

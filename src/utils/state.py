@@ -22,7 +22,14 @@ NO_PDF = "no_pdf"
 FAILED_DOWNLOAD = "failed_download"
 FAILED_CONVERT = "failed_convert"
 
+# A finished paper whose bucket output is an older version than arXiv now has -- set by
+# `harvest` when the OAI feed reports a new version. Claimed like fresh work, and the
+# re-conversion overwrites the same objects.
+OUTDATED = "outdated"
+
 RETRYABLE = (FAILED_DOWNLOAD, FAILED_CONVERT)
+# What an ordinary claim hands out: never-crawled papers and papers with a newer version.
+FRESH = (PENDING, OUTDATED)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers (
@@ -56,6 +63,11 @@ CREATE TABLE IF NOT EXISTS papers (
 CREATE INDEX IF NOT EXISTS idx_papers_status ON papers(status);
 CREATE INDEX IF NOT EXISTS idx_papers_cat    ON papers(primary_category);
 CREATE INDEX IF NOT EXISTS idx_papers_status_bucket ON papers(status, bucket);
+-- Small key/value store for manifest-wide state, e.g. the OAI harvest watermark.
+CREATE TABLE IF NOT EXISTS kv (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
 """
 
 # `executescript(SCHEMA)` is all CREATE ... IF NOT EXISTS, so it does precisely nothing to a
@@ -140,6 +152,14 @@ class TaskResult:
     # A fallback-converted paper the primary converter failed on again. The row stays
     # exactly as it was -- `done`, with its fallback output -- and only the try is counted.
     upgrade_failed: bool = False
+
+
+def _vnum(version: str | None) -> int:
+    """`"v3"` -> 3; anything unparseable sorts first."""
+    try:
+        return int(str(version or "v0").lstrip("v"))
+    except ValueError:
+        return 0
 
 
 def _utcnow() -> str:
@@ -269,11 +289,84 @@ class Manifest:
             cur = self.conn.executemany(sql, batch)
         return cur.rowcount
 
+    # --- incremental metadata (OAI harvest) -------------------------------------------
+    def get_kv(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_kv(self, key: str, value: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO kv (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+    def latest_update_date(self) -> str | None:
+        """The newest `date_updated` in the manifest: where the snapshot leaves off."""
+        return self.conn.execute("SELECT MAX(date_updated) FROM papers").fetchone()[0]
+
+    def apply_updates(
+        self, rows: Iterable[PaperRow], *, recrawl: bool = True, dry_run: bool = False,
+    ) -> dict[str, int]:
+        """Fold harvested records into the manifest.
+
+        New ids are inserted as `pending`, exactly as `prepare` would. An id already here
+        whose incoming version is *newer* has its metadata refreshed; if it was `done` and
+        `recrawl` is set it becomes `outdated`, so the next run re-crawls it and overwrites
+        its objects. `in_flight` rows are never touched -- the writer is about to overwrite
+        them and would undo the change, or worse, record the old version as current.
+
+        Same or older versions are ignored: the OAI feed reports any metadata change (a new
+        DOI, a journal ref), and those do not change the PDF.
+        """
+        counts = {"inserted": 0, "version_bumped": 0, "requeued": 0, "unchanged": 0}
+        rows = list(rows)
+        if not rows:
+            return counts
+        conn = self.conn
+        have = {}
+        ids = [r.arxiv_id for r in rows]
+        for i in range(0, len(ids), 900):            # SQLite's bound-parameter ceiling
+            chunk = ids[i:i + 900]
+            have.update(
+                (r["arxiv_id"], (r["version"], r["status"])) for r in conn.execute(
+                    f"SELECT arxiv_id, version, status FROM papers "
+                    f"WHERE arxiv_id IN ({', '.join('?' * len(chunk))})", chunk))
+
+        new_rows, bumps = [], []
+        for row in rows:
+            if row.arxiv_id not in have:
+                new_rows.append(row)
+                continue
+            old_version, status = have[row.arxiv_id]
+            if _vnum(row.version) <= _vnum(old_version) or status == IN_FLIGHT:
+                counts["unchanged"] += 1
+                continue
+            requeue = recrawl and status == DONE
+            bumps.append((row, OUTDATED if requeue else status))
+            counts["version_bumped"] += 1
+            counts["requeued"] += int(requeue)
+
+        if dry_run:
+            counts["inserted"] = len(new_rows)
+            return counts
+        counts["inserted"] = self.add_papers(new_rows) if new_rows else 0
+        with conn:
+            conn.executemany(
+                "UPDATE papers SET version = ?, title = ?, authors = ?, categories = ?, "
+                "  primary_category = ?, doi = ?, date_updated = ?, status = ?, "
+                "  attempts = CASE WHEN ? = 'outdated' THEN 0 ELSE attempts END, "
+                "  upgrade_attempts = CASE WHEN ? = 'outdated' THEN 0 ELSE upgrade_attempts END "
+                "WHERE arxiv_id = ? AND status <> 'in_flight'",
+                [(r.version, r.title, r.authors, r.categories, r.primary_category, r.doi,
+                  r.date_updated, st, st, st, r.arxiv_id) for r, st in bumps],
+            )
+        return counts
+
     # Worker helper function --> No duplicate task handling between workers
     def claim_batch(
         self,
         n: int,
-        statuses: tuple[str, ...] = (PENDING,),
+        statuses: tuple[str, ...] = FRESH,
         *,
         max_attempts: int | None = None,
         partition: "Slice | None" = None,
@@ -474,6 +567,24 @@ class Manifest:
             params = (DONE,)
         return [r[0] for r in self.conn.execute(sql, params) if r[0]]
 
+    # An `outdated` row's objects in the bucket hold the *previous* version, so their mere
+    # presence proves nothing. This SQL condition is ANDed into the UPDATE below, which runs
+    # over `papers` with the bucket's view of each paper in the TEMP table `sync_found`
+    # (arxiv_id, md_bytes, completed_at = the md object's last-modified, ISO-8601 UTC, may be
+    # NULL). It must be true for every row the sync may mark done.
+    #   papers.status        -- 'pending', 'outdated', 'failed_download', 'no_pdf', ...
+    #   papers.date_updated  -- ISO date of the newest version, e.g. '2026-11-05'
+    # An object with no timestamp is of unknown age, so it is treated as stale: the cost of
+    # that guess is one redundant re-crawl, the cost of the other is a stale paper kept
+    # forever. Comparing the first 10 characters puts an ISO timestamp and an ISO date on
+    # the same footing; `>=` because a re-crawl on the day the version appeared is current.
+    _OUTDATED_GUARD_SQL = (
+        "papers.status <> 'outdated' OR COALESCE(("
+        "  SELECT substr(f.completed_at, 1, 10) FROM sync_found f"
+        "  WHERE f.arxiv_id = papers.arxiv_id"
+        "), '') >= COALESCE(papers.date_updated, '9999-12-31')"
+    )
+
     def mark_done_from_objects(
         self, found: Iterable[tuple[str, int, str | None]], *, dry_run: bool = False
     ) -> dict[str, int]:
@@ -533,7 +644,8 @@ class Manifest:
                 # this device's own run: flipping a live row to `done` only has the
                 # ManifestWriter overwrite it moments later, and if that paper then fails,
                 # `_apply` writes completed_at = NULL and the timestamp is lost.
-                "  AND status NOT IN (?, ?)",
+                "  AND status NOT IN (?, ?)"
+                f"  AND ({self._OUTDATED_GUARD_SQL})",
                 (DONE, DONE, IN_FLIGHT),
             )
             counts["newly_marked"] = cur.rowcount

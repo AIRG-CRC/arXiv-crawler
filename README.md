@@ -21,6 +21,7 @@ data/meta/2301/2301.12345.json          title, authors, date, doi, categories, .
 - [How it works](#how-it-works)
 - [Life of a paper](#life-of-a-paper)
 - [Quickstart](#quickstart)
+- [Keeping up with new papers](#keeping-up-with-new-papers)
 - [Output format](#output-format)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
@@ -162,6 +163,102 @@ Start with a small `--limit`. See [arXiv usage policy](#arxiv-usage-policy) befo
 
 ---
 
+## Keeping up with new papers
+
+The Kaggle snapshot stops on the day it was downloaded. Rather than re-downloading 4.5 GB each
+week, `update` asks arXiv for every paper submitted or revised since the manifest's
+high-water mark, and folds it in:
+
+```bash
+python -m src.main update            # since the last update (or the snapshot's newest date)
+```
+
+```bash
+python -m src.main update --from 2026-11-01 --dry-run   # count only, write nothing
+```
+
+`run-minio` does this by itself before every crawl (`update.on_start: true`; `--no-update`
+skips it once). A failed update is a warning, not an error — the crawl carries on with the
+manifest it has. Measured: four days of cs.LG + cs.CL (903 papers) in 3 seconds.
+
+| What arXiv reports | What happens |
+|---|---|
+| a paper not in the manifest, inside `scope` | inserted as `pending` |
+| a paper not in the manifest, outside `scope` | ignored |
+| a newer version of a `done` paper | metadata refreshed, status `outdated`; the next run re-crawls it and **overwrites** its objects in the bucket |
+| a newer version of a `pending` / failed paper | metadata refreshed, status kept |
+| a newer version of an `in_flight` paper | left alone (the running crawl owns it) |
+| the same version (a DOI or journal-ref edit) | ignored |
+
+### Where the metadata comes from
+
+`update.source: api` (the default) reads arXiv's
+[search API](https://info.arxiv.org/help/api/index.html) sorted by `lastUpdatedDate`, newest
+first, one page every `update.page_delay` seconds, and stops at the first page that reaches
+back past the watermark. Two of its quirks shaped that:
+
+- A `lastUpdatedDate:[…]` *filter* is silently rewritten into `submittedDate` (the echoed
+  query title shows it), so it would find new papers but never new versions. Sorting
+  instead of filtering catches both.
+- One query pages back at most **30,000 results** — about a week of all of arXiv, much longer
+  for a few categories (the query is narrowed to `scope.categories`). If the gap is longer,
+  the newest 30,000 still go in, a ⚠ line says how far back it reached, and the watermark is
+  *not* moved. Close a gap that long with a fresh Kaggle snapshot and `prepare`.
+
+`update.source: oai` uses OAI-PMH `ListRecords` (`arXivRaw`, the format the Kaggle dump is
+built from) instead: complete history, no ceiling. In November 2026 its uncached requests hit
+arXiv's CDN first-byte timeout (~185 s, then `503`) every time, so it is not the default. The
+client treats a `503` that took over 30 s as that timeout and backs off 60 s, 120 s, 240 s …
+(capped by `update.max_backoff`) rather than obeying its `Retry-After: 1`; a `429` backs off at
+least as long. `update.fallback_oai_url` names a second OAI endpoint; it is off by default,
+because the old `export.arxiv.org/oai2` only redirects to the same server.
+
+Both sources are rewritten into the Kaggle record shape, so `parse_record` / `matches_scope` /
+`to_row` treat a harvested paper exactly like one from the snapshot.
+
+### Details
+
+- **Watermark.** The end date of the last *completed* harvest is stored in the manifest
+  (`kv` table, key `oai_watermark`). An interrupted harvest restarts from the old one, and the
+  inserts it repeats are no-ops. `update.overlap_days` re-reads a couple of days before it.
+- **Same `scope`.** The harvest applies `scope` from `config.yaml` exactly as `prepare` does.
+  Cross-listed papers count: a paper whose primary category is cs.CV but which is cross-listed
+  to cs.LG is in a `cs.LG` scope, unless `primary_only: true`.
+- **Several devices.** Each device harvests on its own; the slices come from `crc32(id)`, so
+  they agree without coordination. A bucket sync will not mark an `outdated` paper done from
+  an object written *before* the new version appeared.
+- Set `update.recrawl_new_versions: false` to only ever add new papers.
+
+---|---|
+| a paper not in the manifest, inside `scope` | inserted as `pending` |
+| a paper not in the manifest, outside `scope` | ignored |
+| a newer version of a `done` paper | metadata refreshed, status `outdated`; the next run re-crawls it and **overwrites** its objects in the bucket |
+| a newer version of a `pending` / failed paper | metadata refreshed, status kept |
+| a newer version of an `in_flight` paper | left alone (the running crawl owns it) |
+| the same version (a DOI or journal-ref edit) | ignored |
+
+- **Watermark.** The end date of the last *completed* harvest is stored in the manifest
+  (`kv` table, key `oai_watermark`). An interrupted harvest restarts from the old one, and the
+  inserts it repeats are no-ops. `update.overlap_days` re-reads a couple of days before it,
+  because OAI datestamps are per day.
+- **Same `scope`.** The harvest applies `scope` from `config.yaml` exactly as `prepare` does,
+  on this side; no OAI `set` filter is sent.
+- **Several devices.** Each device harvests on its own; the slices come from `crc32(id)`, so
+  they agree without coordination. A bucket sync will not mark an `outdated` paper done from
+  an object written *before* the new version appeared.
+- **Speed.** arXiv can take minutes to build the first page of a large `ListRecords` request,
+  hence `update.timeout: 600`. Pages after that come every `update.page_delay` seconds.
+- **When the feed struggles.** In November 2026 uncached `ListRecords` requests to
+  `oaipmh.arxiv.org` regularly hit the CDN's first-byte timeout (~185 s, then `503`). A `503`
+  that took over 30 s to arrive is treated as that timeout, not OAI flow control, and backs off
+  60 s, 120 s, 240 s … (capped by `update.max_backoff`) instead of obeying its `Retry-After`. A
+  `429` (rate limited) backs off at least as long. `update.fallback_oai_url` names a second endpoint to
+  try if the first fails before its first page; it is off by default, because the old
+  `export.arxiv.org/oai2` only redirects to the same server.
+- Set `update.recrawl_new_versions: false` to only ever add new papers.
+
+---
+
 ## Output format
 
 Three files per paper, all sharded by `yymm` so no directory grows unmanageable. Old-style IDs
@@ -266,6 +363,12 @@ python -m src.main prepare [--metadata PATH] [--categories cs.LG,cs.CL] [--prima
 Streams the snapshot into the manifest. Idempotent — re-running with a wider filter adds work and
 leaves completed papers untouched. Pins each paper's highest version, so downloads are
 reproducible rather than tracking a moving `/pdf/<id>`.
+
+```bash
+python -m src.main update [--from YYYY-MM-DD] [--until YYYY-MM-DD] [--dry-run]
+```
+Adds papers published or revised since the snapshot, from arXiv's search API (or OAI-PMH). See
+[Keeping up with new papers](#keeping-up-with-new-papers).
 
 ```bash
 python -m src.main run [--download-workers N] [--convert-workers M] [--rps R] [--burst B]

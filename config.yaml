@@ -4,6 +4,37 @@ paths:
   #   kaggle datasets download -d Cornell-University/arxiv -p data/metadata --unzip
   metadata_file: data/raw/arxiv-metadata-oai-snapshot.json
 
+# Keeping up with arXiv after the Kaggle snapshot. `update` (and `run-minio`, when
+# `on_start`) asks arXiv for every paper changed since the manifest's high-water mark,
+# inserts the new in-scope papers as pending, and -- with `recrawl_new_versions` -- re-queues
+# finished papers that gained a new version, so their objects in the bucket are rewritten
+# with the latest PDF. The same `scope` applies.
+update:
+  # `api`: export.arxiv.org/api/query, newest-updated first. Fast, but one query pages back
+  # at most 30,000 papers -- about a week of all of arXiv (cs alone sees ~1,400 new or
+  # revised papers a day), far longer for a few categories (the query is narrowed to
+  # `scope.categories`). Beyond that it warns and keeps
+  # the watermark; load a newer Kaggle snapshot instead.
+  # `oai`: OAI-PMH ListRecords. Complete history, but in Nov 2026 its uncached requests
+  # timed out at arXiv's CDN every time.
+  source: api
+  api_url: https://export.arxiv.org/api/query
+  api_page_size: 1000
+  oai_url: https://oaipmh.arxiv.org/oai
+  # Tried when `oai_url` fails before its first page. Null disables it. (export.arxiv.org/oai2
+  # is no use here: it only redirects to oaipmh.arxiv.org.)
+  fallback_oai_url: null
+  metadata_prefix: arXivRaw
+  on_start: true
+  overlap_days: 2 # re-read a little before the watermark; inserts are idempotent
+  recrawl_new_versions: true
+  page_delay: 3.0 # seconds between pages, as arXiv asks of API clients and harvesters
+  timeout: 600 # per request; OAI can take minutes to build a ListRecords page
+  max_attempts: 5 # per page (and per endpoint, for OAI)
+  # A 503 that arrives after a long wait is a server timeout, not flow control: back off
+  # 60s, 120s, 240s ... up to this many seconds rather than obeying its `Retry-After: 1`.
+  max_backoff: 900
+
 # Which papers `prepare` loads into the manifest. Empty/null means "no filter".
 scope:
   categories: []
